@@ -1,0 +1,36 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Local DearMeta environments and caches
+.dearmeta/
+.dearmeta_/
+.dearmeta_cache/
+
+# GEO workspaces and large datasets
+GSE*/
+
+# Generated reports, debug outputs, and temporary files
+tmp_*/
+tmp_*.html
+tmp_*.png
+tmp_*.pdf
+tmp_*.rds
+test_*_files/
+test_*.html
+debug_*/
+debug_*.html
+debug_*.txt
+Rplots.pdf
+
+# R session history
+.Rhistory
+
+# Editor settings
+.vscode/
+.idea/
