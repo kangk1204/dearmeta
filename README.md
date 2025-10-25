@@ -92,8 +92,6 @@ GSE123456/
 └── runtime/            # logs, run_config.json, pipeline artifacts
 ```
 
-Large GEO artifacts (`GSE*/`, `.dearmeta*/`, HTML reports, etc.) are excluded by `.gitignore`. You can safely delete them and regenerate with the CLI whenever needed.
-
 ## Tips & Troubleshooting
 - **Reusing downloads:** Copy `.dearmeta_cache/` from an existing machine to avoid re-downloading long-lived GEO artifacts.
 - **Verbose logging:** Append `--verbose` to `dearmeta` commands to print debug logs and capture them in `runtime/pipeline.log`.
