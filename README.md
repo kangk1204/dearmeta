@@ -73,6 +73,7 @@ These are commonly needed when compiling R or Python dependencies.
    dearmeta download --gse GSE123456
    ```
 3. Open `GSE123456/configure.tsv` and fill the `dear_group` column with your biological groups.
+   > `configure.tsv` now lives directly under the workspace root (e.g. `GSE123456/configure.tsv`). If you are reusing a workspace created by an older DearMeta version, you might still have `runtime/configure.tsv`; the CLI will warn and fall back to that file, but new runs always write next to the workspace root for easier editing.
 4. Launch the R analysis:
    ```bash
    dearmeta analysis --gse GSE123456
