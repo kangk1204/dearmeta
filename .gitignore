@@ -7,6 +7,10 @@ __pycache__/
 dist/
 build/
 
+# Virtual environments
+.venv/
+venv/
+
 # Local DearMeta environments and caches
 .dearmeta/
 .dearmeta_/
@@ -27,6 +31,23 @@ debug_*/
 debug_*.html
 debug_*.txt
 Rplots.pdf
+
+# Python/R tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# R workspace files
+.RData
+.Rproj.user/
+*.Rproj
+
+# Local environment files
+.env
+.env.*
 
 # R session history
 .Rhistory
