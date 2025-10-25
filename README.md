@@ -25,6 +25,15 @@ sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-
 ```
 These are commonly needed when compiling R or Python dependencies.
 
+**Apple Silicon (macOS M1–M4) tips:**
+- Install [Homebrew](https://brew.sh/) if it is not already available, then run:
+  ```bash
+  brew install python@3.11 libxml2 curl openssl
+  python3 -m venv .venv
+  ```
+- Install R 4.0+ using the official Apple Silicon installer from CRAN (the `.pkg` under “macOS arm64”).
+- If R packages complain about headers, export `PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:$PKG_CONFIG_PATH"` before re-running `Rscript scripts/install.R`.
+
 ## Installation (Step by Step)
 
 1. **Clone the repository**
