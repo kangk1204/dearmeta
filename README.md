@@ -7,7 +7,7 @@ DearMeta is a command-line toolkit that downloads, preprocesses, and analyses Il
 - Download paired IDAT files with caching to avoid duplicate transfers.
 - Create a consistent workspace layout for every dataset.
 - Run an opinionated R analysis pipeline (`scripts/analysis.R`) to produce QC plots, differential methylation tables, and HTML reports.
-- Preserve run configurations (`runtime/configure.tsv`) and logs for reproducibility.
+- Preserve run configurations (`configure.tsv` in each workspace root) and logs for reproducibility.
 
 ## Prerequisites
 
@@ -72,7 +72,7 @@ These are commonly needed when compiling R or Python dependencies.
    ```bash
    dearmeta download --gse GSE123456
    ```
-3. Open `GSE123456/runtime/configure.tsv` and fill the `dear_group` column with your biological groups.
+3. Open `GSE123456/configure.tsv` and fill the `dear_group` column with your biological groups.
 4. Launch the R analysis:
    ```bash
    dearmeta analysis --gse GSE123456
@@ -82,12 +82,13 @@ DearMeta will create a workspace per series:
 
 ```
 GSE123456/
+├── configure.tsv       # group assignments + covariates
 ├── 01_download/        # raw IDAT files, series matrix, metadata
 ├── 02_preprocess/      # preprocessed objects
 ├── 03_analysis/        # analysis outputs
 ├── 04_figures/         # static plots
 ├── 05_interactive/     # HTML/interactive reports
-└── runtime/            # configure.tsv, logs, run_config.json
+└── runtime/            # logs, run_config.json, pipeline artifacts
 ```
 
 Large GEO artifacts (`GSE*/`, `.dearmeta*/`, HTML reports, etc.) are excluded by `.gitignore`. You can safely delete them and regenerate with the CLI whenever needed.

@@ -144,7 +144,7 @@ def download(
 
     metadata_frame, numeric_covariates, candidate_batches = infer_column_types(metadata_frame)
     metadata_summary = summarize_metadata(metadata_frame)
-    configure_path = paths["runtime"] / "configure.tsv"
+    configure_path = root / "configure.tsv"
     generate_configure_tsv(metadata_frame, configure_path, candidate_batches, numeric_covariates)
 
     run_config = {
@@ -170,14 +170,15 @@ def download(
     readme_content = f"""DearMeta workspace for {gse}
 
 Structure:
-- runtime/configure.tsv : fill dear_group column before running analysis
+- configure.tsv         : fill dear_group column before running analysis
 - 01_download/idat/     : raw IDAT files (auto gunzipped)
 - 01_download/metadata/ : GEO metadata artifacts
 - 04_figures/           : static plots
 - 05_interactive/       : HTML interactive reports
+- runtime/              : logs, run_config.json
 
 Next steps:
-1. Review runtime/configure.tsv
+1. Review configure.tsv
 2. Fill the dear_group column with biological group labels
 3. Run `dearmeta analysis --gse {gse}`
 """
@@ -204,9 +205,18 @@ def analysis(
     pipeline_log = paths["runtime"] / "pipeline.log"
     ensure_log_file_handler(logger, pipeline_log)
 
-    configure_path = paths["runtime"] / "configure.tsv"
+    configure_path = root / "configure.tsv"
+    legacy_config_path = paths["runtime"] / "configure.tsv"
     if not configure_path.exists():
-        raise typer.BadParameter(f"Missing configure.tsv at {configure_path}")
+        if legacy_config_path.exists():
+            logger.warning(
+                "Using legacy configure.tsv at %s (preferred location: %s)",
+                legacy_config_path,
+                configure_path,
+            )
+            configure_path = legacy_config_path
+        else:
+            raise typer.BadParameter(f"Missing configure.tsv at {configure_path}")
 
     with ExitStack() as stack:
         if r_script is None:
