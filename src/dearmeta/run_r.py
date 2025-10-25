@@ -73,9 +73,9 @@ def run_r_analysis(
     captured_lines = []
     assert process.stdout is not None
     try:
-        for line in process.stdout:
-            line = line.rstrip("\n")
-            logger.info(line)
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\n")
+            print(line, flush=True)
             captured_lines.append(line)
     finally:
         process.wait()

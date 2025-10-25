@@ -192,6 +192,12 @@ Next steps:
 def analysis(
     gse: str = typer.Option(..., "--gse", help="GEO series accession (e.g. GSE123456)."),
     min_group_size: int = typer.Option(2, help="Minimum samples per group required for analysis."),
+    group_ref: Optional[str] = typer.Option(
+        None,
+        "--group-ref",
+        "--group_ref",
+        help="Group label to use as the reference (baseline) in limma contrasts.",
+    ),
     r_script: Optional[Path] = typer.Option(
         None,
         help="Path to the analysis R script. Defaults to the packaged resource.",
@@ -239,17 +245,33 @@ def analysis(
         if (group_sizes < min_group_size).any():
             problematic = group_sizes[group_sizes < min_group_size].to_dict()
             raise typer.BadParameter(f"Groups with insufficient sample count: {problematic}")
+        normalized_group_ref: Optional[str] = None
+        if group_ref is not None:
+            candidate = group_ref.strip()
+            if not candidate:
+                raise typer.BadParameter("--group-ref cannot be empty")
+            if candidate not in group_sizes.index:
+                raise typer.BadParameter(
+                    f"--group-ref '{candidate}' is not present in dear_group. Available groups: {sorted(group_sizes.index.tolist())}"
+                )
+            normalized_group_ref = candidate
 
         logger.info("Running R analysis for %s with %s samples", gse, retained.shape[0])
         logger.debug("Using R script at %s", script_path)
+        extra_args = ["--top-n-cpgs", str(top_n_cpgs)]
+        if normalized_group_ref:
+            extra_args.extend(["--group-ref", normalized_group_ref])
+        env = {"DEARMETA_GROUPS_JSON": json.dumps(group_sizes.to_dict())}
+        if normalized_group_ref:
+            env["DEARMETA_GROUP_REFERENCE"] = normalized_group_ref
         run_r_analysis(
             gse=gse,
             project_root=root,
             config_path=configure_path,
             output_root=root,
             r_script=script_path,
-            extra_args=["--top-n-cpgs", str(top_n_cpgs)],
-            env={"DEARMETA_GROUPS_JSON": json.dumps(group_sizes.to_dict())},
+            extra_args=extra_args,
+            env=env,
         )
     console.print(f"[bold green]Analysis complete[/] for {gse}. See runtime/analysis_summary.json for details.")
 

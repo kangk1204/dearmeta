@@ -23,7 +23,8 @@ suppressPackageStartupMessages({
 })
 
 set.seed(1234)
-options(SESAMEDATA_USE_ALT = TRUE)
+use_alt_repo <- tolower(Sys.getenv("DEARMETA_SESAME_ALT", "false"))
+options(SESAMEDATA_USE_ALT = use_alt_repo %in% c("1", "true", "yes", "on"))
 
 # ---- Option parsing ---------------------------------------------------------
 
@@ -33,6 +34,7 @@ option_list <- list(
   make_option("--config", type = "character", dest = "config", help = "Path to configure.tsv"),
   make_option("--output-root", type = "character", dest = "output_root", help = "Root directory for outputs"),
   make_option("--min-group-size", type = "integer", dest = "min_group_size", default = 2, help = "Minimum samples per group"),
+  make_option("--group-ref", type = "character", dest = "group_ref", default = NULL, help = "Group label to use as the reference/baseline for contrasts"),
   make_option("--fdr-threshold", type = "double", dest = "fdr_threshold", default = 0.05, help = "Adjusted p-value threshold"),
   make_option("--delta-beta-threshold", type = "double", dest = "delta_beta_threshold", default = 0.05, help = "Absolute delta-beta threshold"),
   make_option("--top-n-cpgs", type = "integer", dest = "top_n_cpgs", default = 10000, help = "Number of CpGs to retain for plots/tables")
@@ -112,6 +114,8 @@ log_message <- function(...) {
   }
   x
 }
+
+group_reference <- NA_character_
 
 DEFAULT_PROTECTED_BATCH <- c("sex", "gender", "sex_at_birth", "biological_sex")
 
@@ -380,11 +384,30 @@ split_covariates <- function(cfg, batch_cols) {
 safe_factor <- function(x) {
   x <- as.character(x)
   x[x == ""] <- NA_character_
-  factor(x)
+  levels <- unique(na.omit(x))
+  factor(x, levels = levels)
+}
+
+apply_reference_level <- function(levels_vec, reference) {
+  if (is.null(reference) || is.na(reference) || !(reference %in% levels_vec)) {
+    return(levels_vec)
+  }
+  c(reference, setdiff(levels_vec, reference))
+}
+
+make_group_factor <- function(values) {
+  f <- safe_factor(values)
+  if (!is.null(group_reference) && !is.na(group_reference)) {
+    lvl <- levels(f)
+    lvl <- apply_reference_level(lvl, group_reference)
+    f <- factor(f, levels = lvl)
+  }
+  f
 }
 
 construct_design <- function(groups, numeric_covars, factor_covars, data, surrogate = NULL) {
-  df <- data.table(group = groups)
+  group_factor <- make_group_factor(groups)
+  df <- data.table(group = group_factor)
   for (col in numeric_covars) {
     df[[col]] <- as.numeric(data[[col]])
   }
@@ -394,7 +417,24 @@ construct_design <- function(groups, numeric_covars, factor_covars, data, surrog
   if (!is.null(surrogate)) {
     df <- cbind(df, surrogate)
   }
-  model.matrix(~ ., data = df)
+  design <- model.matrix(~ ., data = df)
+  group_levels <- levels(group_factor)
+  group_cols <- grep("^group", colnames(design), value = TRUE)
+  if (length(group_levels) >= 2 && length(group_cols) >= 1) {
+    usable <- seq_len(min(length(group_levels) - 1L, length(group_cols)))
+    contrast_info <- data.table(
+      coef = group_cols[usable],
+      reference_group = group_levels[1],
+      target_group = group_levels[-1][usable]
+    )
+    contrast_info[, comparison := sprintf("%s_vs_%s", target_group, reference_group)]
+    attr(design, "group_contrasts") <- contrast_info
+  } else {
+    attr(design, "group_contrasts") <- data.table()
+  }
+  attr(design, "group_levels") <- group_levels
+  attr(design, "reference_group") <- if (length(group_levels) > 0) group_levels[1] else NA_character_
+  design
 }
 
 beta_from_M <- function(M_matrix) {
@@ -423,7 +463,7 @@ apply_combat <- function(M_matrix, metadata, batch_col, design) {
 
 covariate_association_stats <- function(metadata, group_col, numeric_covars = character(), factor_covars = character()) {
   stats <- list()
-  group <- safe_factor(metadata[[group_col]])
+  group <- if (identical(group_col, "dear_group")) make_group_factor(metadata[[group_col]]) else safe_factor(metadata[[group_col]])
   for (col in numeric_covars) {
     values <- metadata[[col]]
     if (all(is.na(values))) {
@@ -705,7 +745,7 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
     stage <- "metric_collection"
     sig_minfi <- filter_significant(results_minfi, opt$fdr_threshold, opt$delta_beta_threshold)
     sig_sesame <- filter_significant(results_sesame, opt$fdr_threshold, opt$delta_beta_threshold)
-    sig_intersection <- if (nrow(sig_minfi) > 0 && nrow(sig_sesame) > 0) length(intersect(sig_minfi$probe_id, sig_sesame$probe_id)) else 0L
+    sig_intersection <- nrow(shared_probe_keys(sig_minfi, sig_sesame))
     batch_median_p_minfi <- score_batch_effect(pca_minfi_post, candidate_batches)
     batch_median_p_sesame <- if (sesame_available && !is.null(M_sesame_corrected)) score_batch_effect(pca_sesame_post, candidate_batches) else NA_real_
     group_stats <- pca_minfi_post$assessments[variable == "dear_group"]
@@ -974,6 +1014,29 @@ fallback_design_selection <- function(metadata, covariates, manual_covariates, p
   stop("Fallback design selection failed; no viable configuration executed successfully.")
 }
 
+resolve_group_contrasts <- function(design, metadata) {
+  contrasts_info <- attr(design, "group_contrasts")
+  if (!is.null(contrasts_info) && inherits(contrasts_info, "data.table") && nrow(contrasts_info) > 0) {
+    return(copy(contrasts_info))
+  }
+  group_levels <- attr(design, "group_levels")
+  if (is.null(group_levels) || length(group_levels) == 0) {
+    group_levels <- levels(make_group_factor(metadata$dear_group))
+  }
+  group_cols <- grep("^group", colnames(design), value = TRUE)
+  if (length(group_levels) < 2 || length(group_cols) == 0) {
+    stop("Design matrix lacks usable dear_group contrasts.")
+  }
+  usable <- seq_len(min(length(group_levels) - 1L, length(group_cols)))
+  info <- data.table(
+    coef = group_cols[usable],
+    reference_group = group_levels[1],
+    target_group = group_levels[-1][usable]
+  )
+  info[, comparison := sprintf("%s_vs_%s", target_group, reference_group)]
+  info
+}
+
 run_limma <- function(M_matrix, beta_matrix, metadata, design) {
   model_id <- getOption("dearmeta.current_model_id", "<unknown>")
   runtime_dir <- getOption("dearmeta.runtime_dir")
@@ -1020,57 +1083,79 @@ run_limma <- function(M_matrix, beta_matrix, metadata, design) {
     log_message("run_limma[%s]: proceeding with %s probes", model_id, nrow(M_matrix))
     fit <- lmFit(M_matrix, design)
     fit <- eBayes(fit)
-    group_coef <- grep("^group", colnames(design), value = TRUE)
-    if (length(group_coef) == 0) {
-      stop("Design matrix lacks a dear_group coefficient")
-    }
-    group_coef <- group_coef[1]
-    log_message("run_limma[%s]: using coefficient %s for group comparison", model_id, group_coef)
-    top <- topTable(fit, coef = group_coef, number = nrow(M_matrix), sort.by = "P")
-    top <- data.table(probe_id = rownames(top), top)
-    available <- top$probe_id[top$probe_id %in% rownames(beta_matrix)]
-    if (length(available) == 0) {
-      stop("No overlapping probes between limma results and beta matrix")
-    }
-    if (length(available) < nrow(top)) {
-      dropped <- setdiff(top$probe_id, available)
-      log_message("run_limma[%s]: omitting %s probes absent from beta matrix during aggregation.", model_id, length(dropped))
-      top <- top[probe_id %in% available]
-    }
-    beta_df <- tryCatch(
-      beta_matrix[top$probe_id, , drop = FALSE],
-      error = function(e) {
-        log_message(
-          "run_limma[%s]: beta subset failure with %s probes; head ids: %s",
-          model_id,
-          length(top$probe_id),
-          paste(head(top$probe_id, 5), collapse = ",")
-        )
-        log_message(
-          "run_limma[%s]: beta rowname head: %s",
-          model_id,
-          paste(head(rownames(beta_matrix), 5), collapse = ",")
-        )
-        stop(e)
+    contrasts_info <- resolve_group_contrasts(design, metadata)
+    metadata_groups <- make_group_factor(metadata$dear_group)
+    results <- vector("list", nrow(contrasts_info))
+    for (idx in seq_len(nrow(contrasts_info))) {
+      contrast <- contrasts_info[idx]
+      coef_name <- contrast$coef
+      log_message(
+        "run_limma[%s]: using coefficient %s for group comparison (%s)",
+        model_id,
+        coef_name,
+        contrast$comparison
+      )
+      top <- topTable(fit, coef = coef_name, number = nrow(M_matrix), sort.by = "P")
+      top <- data.table(probe_id = rownames(top), top)
+      available <- top$probe_id[top$probe_id %in% rownames(beta_matrix)]
+      if (length(available) == 0) {
+        stop("No overlapping probes between limma results and beta matrix")
       }
-    )
-    log_message("run_limma[%s]: beta subset succeeded", model_id)
-    log_message("run_limma[%s]: beta_df dims=%s×%s", model_id, nrow(beta_df), ncol(beta_df))
-    group_levels <- levels(factor(metadata$dear_group))
-    if (length(group_levels) != 2) {
-      stop("Limma model currently supports two-group comparison.")
+      if (length(available) < nrow(top)) {
+        dropped <- setdiff(top$probe_id, available)
+        log_message(
+          "run_limma[%s]: omitting %s probes absent from beta matrix during aggregation.",
+          model_id,
+          length(dropped)
+        )
+        top <- top[probe_id %in% available]
+      }
+      beta_df <- tryCatch(
+        beta_matrix[top$probe_id, , drop = FALSE],
+        error = function(e) {
+          log_message(
+            "run_limma[%s]: beta subset failure with %s probes; head ids: %s",
+            model_id,
+            length(top$probe_id),
+            paste(head(top$probe_id, 5), collapse = ",")
+          )
+          log_message(
+            "run_limma[%s]: beta rowname head: %s",
+            model_id,
+            paste(head(rownames(beta_matrix), 5), collapse = ",")
+          )
+          stop(e)
+        }
+      )
+      log_message("run_limma[%s]: beta subset succeeded", model_id)
+      log_message("run_limma[%s]: beta_df dims=%s×%s", model_id, nrow(beta_df), ncol(beta_df))
+      ref_group <- contrast$reference_group
+      target_group <- contrast$target_group
+      ref_mask <- metadata_groups == ref_group
+      target_mask <- metadata_groups == target_group
+      if (!any(ref_mask)) {
+        stop(sprintf("No samples found for reference group %s", ref_group))
+      }
+      if (!any(target_mask)) {
+        stop(sprintf("No samples found for target group %s", target_group))
+      }
+      beta_ref <- tryCatch(rowMeans(beta_df[, ref_mask, drop = FALSE], na.rm = TRUE), error = function(e) {
+        log_message("run_limma[%s]: rowMeans %s failed", model_id, ref_group)
+        stop(e)
+      })
+      beta_target <- tryCatch(rowMeans(beta_df[, target_mask, drop = FALSE], na.rm = TRUE), error = function(e) {
+        log_message("run_limma[%s]: rowMeans %s failed", model_id, target_group)
+        stop(e)
+      })
+      delta_beta <- beta_target - beta_ref
+      top[, delta_beta := delta_beta]
+      top[, direction := ifelse(delta_beta > 0, "hypermethylated", "hypomethylated")]
+      top[, comparison := contrast$comparison]
+      top[, reference_group := ref_group]
+      top[, target_group := target_group]
+      results[[idx]] <- top
     }
-    beta_group1 <- tryCatch(rowMeans(beta_df[, metadata$dear_group == group_levels[1], drop = FALSE], na.rm = TRUE), error = function(e) {
-      log_message("run_limma[%s]: rowMeans group1 failed", model_id)
-      stop(e)
-    })
-    beta_group2 <- tryCatch(rowMeans(beta_df[, metadata$dear_group == group_levels[2], drop = FALSE], na.rm = TRUE), error = function(e) {
-      log_message("run_limma[%s]: rowMeans group2 failed", model_id)
-      stop(e)
-    })
-    top[, delta_beta := beta_group2 - beta_group1]
-    top[, direction := ifelse(delta_beta > 0, "hypermethylated", "hypomethylated")]
-    top
+    rbindlist(results, use.names = TRUE, fill = TRUE)
   }, error = function(e) {
     if (!is.null(runtime_dir) && dir.exists(runtime_dir)) {
       safe_model <- gsub("[^A-Za-z0-9_]+", "_", model_id)
@@ -1100,6 +1185,7 @@ limit_top_hits <- function(dt, n = 10000) {
   if (!inherits(dt, "data.frame") && !inherits(dt, "data.table")) {
     return(dt)
   }
+  dt <- as.data.table(dt)
   dt_names <- names(dt)
   if (is.null(dt_names) || !("P.Value" %in% dt_names)) {
     return(dt)
@@ -1108,11 +1194,48 @@ limit_top_hits <- function(dt, n = 10000) {
   if (is.na(rows) || rows <= 0) {
     return(dt)
   }
-  if (rows <= n) {
-    return(dt)
+  if ("comparison" %in% dt_names) {
+    dt[
+      ,
+      {
+        ordered <- .SD[order(P.Value)]
+        ordered[seq_len(min(n, nrow(ordered)))]
+      },
+      by = comparison
+    ]
+  } else {
+    if (rows <= n) {
+      return(dt)
+    }
+    dt <- dt[order(P.Value)]
+    dt[seq_len(min(n, nrow(dt)))]
   }
-  dt <- dt[order(P.Value)]
-  dt[seq_len(min(n, nrow(dt)))]
+}
+
+group_key_columns <- function(dt) {
+  cols <- intersect(c("probe_id", "comparison"), names(dt))
+  if (!("probe_id" %in% cols) && "probe_id" %in% names(dt)) {
+    cols <- "probe_id"
+  }
+  unique(cols)
+}
+
+shared_probe_keys <- function(lhs, rhs) {
+  if (is.null(lhs) || is.null(rhs) || nrow(lhs) == 0 || nrow(rhs) == 0) {
+    return(data.table())
+  }
+  lhs_dt <- as.data.table(lhs)
+  rhs_dt <- as.data.table(rhs)
+  key_cols <- intersect(group_key_columns(lhs_dt), group_key_columns(rhs_dt))
+  if (length(key_cols) == 0 || !"probe_id" %in% key_cols) {
+    if (!"probe_id" %in% names(lhs_dt) || !"probe_id" %in% names(rhs_dt)) {
+      return(data.table())
+    }
+    key_cols <- "probe_id"
+  }
+  lhs_keys <- unique(lhs_dt[, ..key_cols])
+  rhs_keys <- unique(rhs_dt[, ..key_cols])
+  merge(lhs_keys, rhs_keys, by = key_cols, all = FALSE, sort = FALSE)
 }
 
 filter_significant <- function(res, fdr, delta_thresh) {
@@ -1120,11 +1243,19 @@ filter_significant <- function(res, fdr, delta_thresh) {
 }
 
 merge_results <- function(minfi, sesame) {
-  minfi[, pipeline := "minfi"]
-  sesame[, pipeline := "sesame"]
-  union <- rbindlist(list(minfi, sesame), fill = TRUE, use.names = TRUE)
-  union[, shared_significant := probe_id %in% intersect(minfi$probe_id, sesame$probe_id)]
-  intersection <- minfi[probe_id %in% sesame$probe_id]
+  minfi_dt <- copy(as.data.table(minfi))
+  sesame_dt <- copy(as.data.table(sesame))
+  minfi_dt[, pipeline := "minfi"]
+  sesame_dt[, pipeline := "sesame"]
+  union <- rbindlist(list(minfi_dt, sesame_dt), fill = TRUE, use.names = TRUE)
+  shared_keys <- shared_probe_keys(minfi_dt, sesame_dt)
+  union[, shared_significant := FALSE]
+  intersection <- minfi_dt[0]
+  if (nrow(shared_keys) > 0) {
+    key_cols <- names(shared_keys)
+    union[shared_keys, shared_significant := TRUE, on = key_cols]
+    intersection <- minfi_dt[shared_keys, on = key_cols, nomatch = 0]
+  }
   list(union = union, intersection = intersection)
 }
 
@@ -2576,6 +2707,24 @@ if (any(group_counts < opt$min_group_size)) {
   stop("Insufficient samples per group: ", paste(names(group_counts[group_counts < opt$min_group_size]), collapse = ", "))
 }
 
+if (!is.null(opt$group_ref) && nzchar(trimws(opt$group_ref))) {
+  candidate_ref <- trimws(opt$group_ref)
+  unique_groups <- unique(config$dear_group)
+  if (!(candidate_ref %in% unique_groups)) {
+    stop(
+      sprintf(
+        "Specified --group-ref '%s' not found in dear_group values. Available groups: %s",
+        candidate_ref,
+        paste(sort(unique_groups), collapse = ", ")
+      )
+    )
+  }
+  group_reference <- candidate_ref
+  log_message("Using %s as the reference group for contrasts.", group_reference)
+} else {
+  group_reference <- NA_character_
+}
+
 log_message("Loaded", nrow(config), "samples for analysis across groups:", paste(names(group_counts), group_counts, sep = "=", collapse = "; "))
 
 # Determine candidate batches and covariates
@@ -3005,9 +3154,7 @@ covars$factor <- selected_covariates$factor
 design_without_sv <- best_outputs$design_base
 surrogate_vars <- best_outputs$surrogate_vars
 design_for_limma <- best_outputs$design_with_sv
-if (ncol(design_for_limma) >= 2) {
-  colnames(design_for_limma)[2] <- "groupdear_group"
-}
+group_comparisons <- resolve_group_contrasts(design_for_limma, metadata_dt)
 
 M_minfi_corrected <- best_outputs$M_minfi
 beta_minfi <- best_outputs$beta_minfi
@@ -3121,45 +3268,104 @@ write_tsv_gz(integrated$union, file.path(analysis_dir, "cpg_union.tsv.gz"))
 
 # ---- DMRcate ----------------------------------------------------------------
 
+run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type, comparisons, sig_table) {
+  empty_result <- data.table(
+    seqnames = character(),
+    start = integer(),
+    end = integer(),
+    width = integer(),
+    n.sites = integer(),
+    meanstat = numeric(),
+    comparison = character(),
+    reference_group = character(),
+    target_group = character()
+  )
+  if (nrow(sig_table) == 0) {
+    log_message("Skipping DMRcate for %s: no significant CpGs detected at FDR threshold.", pipeline_name)
+    return(empty_result)
+  }
+  if (nrow(comparisons) == 0) {
+    log_message("Skipping DMRcate for %s: no group contrasts available.", pipeline_name)
+    return(empty_result)
+  }
+  results <- list()
+  sig_has_comparison <- "comparison" %in% names(sig_table)
+  for (idx in seq_len(nrow(comparisons))) {
+    contrast <- comparisons[idx]
+    comparison_label <- contrast$comparison
+    if (sig_has_comparison && !(comparison_label %in% sig_table$comparison)) {
+      log_message("Skipping DMRcate for %s (%s): no significant CpGs for this comparison.", pipeline_name, comparison_label)
+      next
+    }
+    log_message("Running DMRcate for %s (%s)", pipeline_name, comparison_label)
+    annotation <- tryCatch(
+      cpg.annotate(
+        object = M_matrix,
+        datatype = "array",
+        what = "M",
+        arraytype = array_type,
+        analysis.type = "differential",
+        design = design,
+        coef = contrast$coef
+      ),
+      error = function(e) {
+        log_message("DMRcate annotation failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
+        NULL
+      }
+    )
+    if (is.null(annotation)) {
+      next
+    }
+    dmr_obj <- tryCatch(dmrcate(annotation), error = function(e) {
+      log_message("DMRcate modelling failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
+      NULL
+    })
+    if (is.null(dmr_obj)) {
+      next
+    }
+    dmr_ranges <- tryCatch(
+      as.data.table(as.data.frame(extractRanges(dmr_obj, genome = "hg38"))),
+      error = function(e) {
+        log_message("DMRcate range extraction failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
+        NULL
+      }
+    )
+    if (!is.null(dmr_ranges) && nrow(dmr_ranges) > 0) {
+      dmr_ranges[, comparison := comparison_label]
+      dmr_ranges[, reference_group := contrast$reference_group]
+      dmr_ranges[, target_group := contrast$target_group]
+      results[[comparison_label]] <- dmr_ranges
+    } else {
+      log_message("DMRcate produced no ranges for %s (%s).", pipeline_name, comparison_label)
+    }
+  }
+  if (length(results) == 0) {
+    return(empty_result)
+  }
+  rbindlist(results, fill = TRUE, use.names = TRUE)
+}
+
 log_message("Running DMRcate...")
 array_type <- platform_info$dmr
-if (nrow(sig_minfi) > 0) {
-  annotation <- cpg.annotate(
-    object = M_minfi_corrected,
-    datatype = "array",
-    what = "M",
-    arraytype = array_type,
-    analysis.type = "differential",
-    design = design_for_limma,
-    coef = "groupdear_group"
-  )
-  dmr_minfi <- dmrcate(annotation)
-  dmr_ranges <- extractRanges(dmr_minfi, genome = "hg38")
-} else {
-  log_message("Skipping DMRcate for minfi: no significant CpGs detected at FDR threshold.")
-  dmr_ranges <- data.frame(seqnames = character(), start = integer(), end = integer(), width = integer(), n.sites = integer(), meanstat = numeric())
-}
-write_tsv_gz(as.data.frame(dmr_ranges), file.path(analysis_dir, "dmr_minfi.tsv.gz"))
+dmr_minfi <- run_dmrcate_for_pipeline("minfi", M_minfi_corrected, design_for_limma, array_type, group_comparisons, sig_minfi)
+write_tsv_gz(dmr_minfi, file.path(analysis_dir, "dmr_minfi.tsv.gz"))
 
-if (sesame_available && !is.null(M_sesame_corrected) && nrow(sig_sesame) > 0) {
-  annotation_sesame <- cpg.annotate(
-    object = M_sesame_corrected,
-    datatype = "array",
-    what = "M",
-    arraytype = array_type,
-    analysis.type = "differential",
-    design = design_for_limma,
-    coef = "groupdear_group"
-  )
-  dmr_sesame <- dmrcate(annotation_sesame)
-  dmr_ranges_sesame <- extractRanges(dmr_sesame, genome = "hg38")
-  write_tsv_gz(as.data.frame(dmr_ranges_sesame), file.path(analysis_dir, "dmr_sesame.tsv.gz"))
+if (sesame_available && !is.null(M_sesame_corrected)) {
+  dmr_sesame <- run_dmrcate_for_pipeline("sesame", M_sesame_corrected, design_for_limma, array_type, group_comparisons, sig_sesame)
+  write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
 } else {
-  if (sesame_available && !is.null(M_sesame_corrected)) {
-    log_message("Skipping DMRcate for sesame: no significant CpGs detected at FDR threshold.")
-  }
-  dmr_ranges_sesame <- data.frame(seqnames = character(), start = integer(), end = integer(), width = integer(), n.sites = integer(), meanstat = numeric())
-  write_tsv_gz(dmr_ranges_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
+  dmr_sesame <- data.table(
+    seqnames = character(),
+    start = integer(),
+    end = integer(),
+    width = integer(),
+    n.sites = integer(),
+    meanstat = numeric(),
+    comparison = character(),
+    reference_group = character(),
+    target_group = character()
+  )
+  write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
 }
 
 # ---- Annotation -------------------------------------------------------------
@@ -3216,36 +3422,46 @@ write_tsv_gz(annotated_minfi, file.path(analysis_dir, "annotated_cpg_minfi.tsv.g
 write_tsv_gz(annotated_sesame, file.path(analysis_dir, "annotated_cpg_sesame.tsv.gz"))
 write_tsv_gz(annotated_intersection, file.path(analysis_dir, "annotated_cpg_intersection.tsv.gz"))
 
-shared_probe_ids <- intersect(annotated_minfi$probe_id, annotated_sesame$probe_id)
-annotated_shared <- if (length(shared_probe_ids) > 0) {
-  minfi_shared <- annotated_minfi[
-    probe_id %in% shared_probe_ids,
-    .(
-      probe_id,
-      chr,
-      mapinfo,
-      gene_symbols,
-      gene_regions,
-      relation_to_island,
-      logFC_minfi = logFC,
-      delta_beta_minfi = delta_beta,
-      adj.P.Val_minfi = adj.P.Val,
-      P.Value_minfi = P.Value,
-      direction_minfi = direction
-    )
-  ]
-  sesame_shared <- annotated_sesame[
-    probe_id %in% shared_probe_ids,
-    .(
-      probe_id,
-      logFC_sesame = logFC,
-      delta_beta_sesame = delta_beta,
-      adj.P.Val_sesame = adj.P.Val,
-      P.Value_sesame = P.Value,
-      direction_sesame = direction
-    )
-  ]
-  shared <- merge(minfi_shared, sesame_shared, by = "probe_id", all = FALSE, sort = FALSE)
+shared_keys <- shared_probe_keys(annotated_minfi, annotated_sesame)
+annotated_shared <- if (nrow(shared_keys) > 0) {
+  key_cols <- names(shared_keys)
+  minfi_subset <- annotated_minfi[shared_keys, on = key_cols, nomatch = 0]
+  sesame_subset <- annotated_sesame[shared_keys, on = key_cols, nomatch = 0]
+  keep_minfi <- c(
+    key_cols,
+    "chr",
+    "mapinfo",
+    "gene_symbols",
+    "gene_regions",
+    "relation_to_island",
+    "logFC",
+    "delta_beta",
+    "adj.P.Val",
+    "P.Value",
+    "direction"
+  )
+  keep_sesame <- c(
+    key_cols,
+    "logFC",
+    "delta_beta",
+    "adj.P.Val",
+    "P.Value",
+    "direction"
+  )
+  keep_minfi <- intersect(keep_minfi, names(minfi_subset))
+  keep_sesame <- intersect(keep_sesame, names(sesame_subset))
+  minfi_shared <- minfi_subset[, ..keep_minfi]
+  sesame_shared <- sesame_subset[, ..keep_sesame]
+  rename_cols <- function(dt, suffix) {
+    cols <- intersect(c("logFC", "delta_beta", "adj.P.Val", "P.Value", "direction"), names(dt))
+    if (length(cols) > 0) {
+      setnames(dt, cols, paste0(cols, "_", suffix))
+    }
+    dt
+  }
+  minfi_shared <- rename_cols(minfi_shared, "minfi")
+  sesame_shared <- rename_cols(sesame_shared, "sesame")
+  shared <- merge(minfi_shared, sesame_shared, by = key_cols, all = FALSE, sort = FALSE)
   if (nrow(shared) > 0) {
     shared[, adj.P.Val_min := pmin(adj.P.Val_minfi, adj.P.Val_sesame)]
     shared[, adj.P.Val_max := pmax(adj.P.Val_minfi, adj.P.Val_sesame)]
@@ -3740,7 +3956,13 @@ save_venn <- function(sets, filename_base) {
 }
 
 if (nrow(sig_minfi) > 0 || nrow(sig_sesame) > 0) {
-  save_venn(list(minfi = sig_minfi$probe_id, sesame = sig_sesame$probe_id), file.path(fig_dir, "venn_minfi_sesame"))
+  save_venn(
+    list(
+      minfi = unique(sig_minfi$probe_id),
+      sesame = unique(sig_sesame$probe_id)
+    ),
+    file.path(fig_dir, "venn_minfi_sesame")
+  )
 }
 
 # ---- Interactive outputs ----------------------------------------------------
@@ -4083,6 +4305,7 @@ summary <- list(
   fdr_threshold = opt$fdr_threshold,
   delta_beta_threshold = opt$delta_beta_threshold,
   groups = as.list(group_counts),
+  group_reference = if (!is.null(group_reference) && !is.na(group_reference)) group_reference else NA_character_,
   candidate_batches = list(
     auto = batch_tracking$auto,
     manual = batch_tracking$manual,

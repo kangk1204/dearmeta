@@ -47,4 +47,27 @@ ensure_bioc <- function(packages) {
 ensure_cran(cran_packages)
 ensure_bioc(bioc_packages)
 
+prefetch_sesame_resources <- function() {
+  if (!requireNamespace("sesameData", quietly = TRUE)) {
+    message("sesameData package is unavailable; skipping resource prefetch.")
+    return(invisible(FALSE))
+  }
+  required_titles <- c("KYCG.EPIC.Mask.20220123")
+  for (title in required_titles) {
+    message("Prefetching sesameData resource: ", title)
+    tryCatch(
+      {
+        invisible(sesameData::sesameDataGet(title))
+        message("  cached ", title)
+      },
+      error = function(e) {
+        message("  failed to cache ", title, ": ", conditionMessage(e))
+      }
+    )
+  }
+  invisible(TRUE)
+}
+
+prefetch_sesame_resources()
+
 message("All R dependencies installed.")

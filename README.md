@@ -78,6 +78,7 @@ These are commonly needed when compiling R or Python dependencies.
    ```bash
    dearmeta analysis --gse GSE123456
    ```
+   > Need a specific baseline? Append `--group-ref normoweight` (alias `--group_ref`) so limma treats that group as the reference when building contrasts. Otherwise the first `dear_group` in your configure file becomes the default reference.
 
 DearMeta will create a workspace per series:
 
