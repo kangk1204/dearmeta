@@ -37,6 +37,31 @@ CANDIDATE_BATCH_KEYS = {
     "chip",
 }
 
+MIN_BATCH_NONMISSING_RATIO = 0.5
+MIN_BATCH_LEVEL_SIZE = 2
+PROTECTED_BATCH_KEYWORDS = ("sex", "gender")
+
+
+def _normalize_name(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _is_protected_column(name: str) -> bool:
+    normalized = _normalize_name(name)
+    return any(keyword in normalized for keyword in PROTECTED_BATCH_KEYWORDS)
+
+
+def _has_sufficient_batch_support(series: pd.Series, total_len: int) -> bool:
+    series = series.dropna()
+    if total_len <= 0 or series.empty:
+        return False
+    if len(series) < max(2 * MIN_BATCH_LEVEL_SIZE, 2):
+        return False
+    if len(series) / total_len < MIN_BATCH_NONMISSING_RATIO:
+        return False
+    counts = series.value_counts()
+    return len(counts) >= 2 and (counts >= MIN_BATCH_LEVEL_SIZE).all()
+
 
 def assemble_metadata_frame(
     samples: Dict[str, SampleMetadata],
@@ -101,7 +126,9 @@ def infer_column_types(frame: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Li
         if not series.any():
             frame.drop(columns=[column], inplace=True)
             continue
-        unique_ratio = series.nunique() / max(len(series), 1)
+        series_clean = series.replace("", pd.NA)
+        non_missing = int(series_clean.notna().sum())
+        unique_ratio = series_clean.nunique(dropna=True) / max(non_missing, 1)
         numeric_series = pd.to_numeric(series, errors="coerce")
         if numeric_series.notna().sum() >= len(series) * 0.6:
             frame[column] = numeric_series
@@ -109,9 +136,15 @@ def infer_column_types(frame: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Li
         else:
             frame[column] = series
             categorical_cols.append(column)
-        if any(key in column for key in CANDIDATE_BATCH_KEYS) and (unique_ratio < 0.9 or len(series) <= 12):
+        if _is_protected_column(column):
+            continue
+        supports_batch = _has_sufficient_batch_support(series_clean.dropna(), len(series))
+        if not supports_batch:
+            continue
+        keyword_match = any(key in column for key in CANDIDATE_BATCH_KEYS)
+        if keyword_match and (unique_ratio < 0.9 or len(series) <= 12):
             candidate_batches.append(column)
-        elif 0 < unique_ratio < 0.2 and len(series.unique()) > 1:
+        elif 0 < unique_ratio < 0.2 and series_clean.nunique(dropna=True) > 1:
             candidate_batches.append(column)
 
     # Remove redundant columns (duplicates)
