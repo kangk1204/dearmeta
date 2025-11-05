@@ -14,31 +14,26 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
 | Requirement | Details |
 |-------------|---------|
 | Python      | 3.10 or newer |
-| R           | 4.0 or newer (needed for the bundled analysis script) |
+| R           | 4.5 or newer (renv.lock pins Bioconductor 3.22 which requires R ≥ 4.5) |
 | Git         | For cloning and keeping the project up to date |
 | Internet    | Required for GEO API calls and supplementary file downloads |
 
-**Recommended system packages (Linux):**
+**Recommended system packages (Linux/WSL):**
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-dev
+sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-dev \\
+  libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
 ```
-These are commonly needed when compiling R or Python dependencies.
+These headers/libs are required when compiling CRAN and Bioconductor packages such as `xml2`, `png`, `rhdf5`, and `Rsamtools`.
 
 **Apple Silicon (macOS M1–M4) tips:**
 - Install [Homebrew](https://brew.sh/) if it is not already available, then run:
   ```bash
   brew install python@3.11 libxml2 curl openssl
   ```
-  If you prefer the Homebrew Python, prepend `/opt/homebrew/opt/python@3.11/bin` to your `PATH`.
-- Create and activate a dedicated virtual environment *before* running any DearMeta scripts so `python3` resolves to that interpreter:
-  ```bash
-  python3 -m venv .dearmeta
-  source .dearmeta/bin/activate
-  ```
-  The bootstrap script installs DearMeta in editable mode, so the `dearmeta` command becomes available inside this environment automatically.
-- Install R 4.4.x (arm64) from CRAN. That release pairs with Bioconductor 3.20, which the installer script now auto-detects and uses to pull the right package versions.
-- If R packages complain about headers, export `PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:$PKG_CONFIG_PATH"` before re-running `bash scripts/bootstrap.sh` (which calls `Rscript scripts/install.R` under the hood).
+  If you prefer the Homebrew Python, prepend `/opt/homebrew/opt/python@3.11/bin` to your `PATH` and create a virtual environment (`python3 -m venv .dearmeta && source .dearmeta/bin/activate`) before running any DearMeta scripts.
+- Install R 4.5+ using the official Apple Silicon installer from CRAN (the `.pkg` under “macOS arm64”). If you are temporarily pinned to R 4.4/Bioconductor 3.20, the bootstrap script auto-detects that release and installs the matching package matrix, but 4.5+ remains the recommended baseline.
+- If R packages complain about headers, export `PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:$PKG_CONFIG_PATH"` before re-running `Rscript scripts/install.R` or `bash scripts/bootstrap.sh`.
 
 ## Installation (Step by Step)
 
@@ -48,18 +43,37 @@ These are commonly needed when compiling R or Python dependencies.
    cd dearmeta
    ```
 
-2. **Create and activate a virtual environment (recommended)**
-   ```bash
-   python3 -m venv .dearmeta
-   source .dearmeta/bin/activate
-   ```
-   If you already have an environment active, skip this step.
+2. **Create and activate a runtime environment (pick one)**
 
-3. **Run the bootstrap script (installs Python + R deps)**
+   **Conda (recommended, keeps Python + R together):**
+   ```bash
+   conda create -n dearmeta python=3.11 r-base=4.5.1 -c conda-forge
+   conda activate dearmeta
+   conda install -y -c conda-forge zlib libpng xz
+   python -m pip install --upgrade pip
+   pip install -r requirements.lock
+   ```
+
+   **System Python virtualenv:**
+   ```bash
+   python -m venv .dearmeta
+   source .dearmeta/bin/activate
+   python -m pip install --upgrade pip
+   pip install -r requirements.lock
+   ```
+   > When using a standalone virtualenv you must also install R ≥4.5 yourself (e.g., via the CRAN Ubuntu repo or the macOS installer) and ensure `Rscript` points at that build.
+
+3. *(Optional but recommended)* **Prime Bioconductor 3.22 inside the active environment**
+   ```bash
+   Rscript scripts/prime-bioconductor.R
+   ```
+   The script installs `BiocManager` + supporting CRAN helpers, pins Bioconductor 3.22, pulls in the "core" group (S4Vectors, IRanges, DelayedArray, SummarizedExperiment, etc.), and then caches the genomics stack (`XVector`, `Biostrings`, `Rsamtools`, `GEOquery`, …) that DearMeta needs before running the main bootstrap. If you prefer to run the commands manually, inspect the script contents for the exact `BiocManager::install()` calls.
+
+4. **Run the bootstrap script (installs pinned Python + R deps)**
    ```bash
    bash scripts/bootstrap.sh
    ```
-   This wraps the three manual steps (pip install, `renv::restore`, `scripts/install.R`). You only need to re-run it when dependencies change.
+   This wraps the three manual steps (pip install, `renv::restore`, `scripts/install.R`). You only need to re-run it when dependencies change. The script reads `renv.lock` and refuses to continue if the `Rscript` on your PATH is older than the pinned R version; set `RSCRIPT=/path/to/Rscript-4.5` when you manage multiple builds.
 
 ## Quick Start
 
@@ -116,6 +130,11 @@ GSE123456/
 - **Reusing downloads:** Copy `.dearmeta_cache/` from an existing machine to avoid re-downloading long-lived GEO artifacts.
 - **Verbose logging:** Append `--verbose` to `dearmeta` commands to print debug logs and capture them in `runtime/pipeline.log`.
 - **R package errors:** Ensure the system libraries listed above are installed, then rerun `Rscript scripts/install.R`.
+- **R version mismatch:** `scripts/bootstrap.sh` requires R ≥ the version recorded in `renv.lock` (currently 4.5.1). Install a recent R build or point the script at the right binary via `RSCRIPT=/opt/R/4.5/bin/Rscript bash scripts/bootstrap.sh`.
+- **Bioconductor bootstrap:** If `install.R` complains about missing packages such as `XVector` or `SparseArray`, rerun `Rscript scripts/prime-bioconductor.R` to preinstall the base Bioconductor stack before invoking the bootstrap script again.
+- **libpng / zlib link errors:** When CRAN's `png` package fails with `cannot find -lz`, install the matching Conda libraries inside the active env (`conda install -c conda-forge zlib libpng xz`) so `R CMD INSTALL` can link against them.
+- **libxml2 / XML package errors:** `scripts/bootstrap.sh` automatically points `XML_CONFIG` at `/usr/bin/xml2-config` and exports the required include/library paths when it exists. If you are on a non-Debian system, set `XML_CONFIG` to your system `xml2-config` path before running the script so CRAN's `XML`/`xml2` packages can link successfully.
+- **Bioconductor version drift:** When Bioconductor only ships a newer release of a pinned package (e.g., `sesameData` or `FlowSorted.*`), the bootstrap script logs a warning and keeps the newer build because it is ≥ the lockfile version.
 
 ## Development Notes
 - Core Python sources live in `src/dearmeta/`.

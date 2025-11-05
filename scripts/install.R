@@ -90,14 +90,21 @@ ensure_bioc <- function(packages, bioc_version = NULL) {
     if (!identical(installed, target_version)) {
       message(sprintf("Installing %s@%s from Bioconductor %s", pkg, target_version, resolved_version))
       if (is.null(bioc_version)) {
-        BiocManager::install(pkg, ask = FALSE, update = FALSE)
+        BiocManager::install(pkg, ask = FALSE, update = FALSE, force = TRUE)
       } else {
-        BiocManager::install(pkg, ask = FALSE, update = FALSE, version = bioc_version)
+        BiocManager::install(pkg, ask = FALSE, update = FALSE, version = bioc_version, force = TRUE)
       }
     }
     installed_now <- if (requireNamespace(pkg, quietly = TRUE)) as.character(packageVersion(pkg)) else NULL
-    if (!identical(installed_now, target_version)) {
+    if (is.null(installed_now)) {
       stop(sprintf("Pinned version %s@%s could not be installed", pkg, target_version))
+    }
+    cmp <- utils::compareVersion(installed_now, target_version)
+    if (cmp < 0) {
+      stop(sprintf("Pinned version %s@%s could not be installed; remaining at %s", pkg, target_version, installed_now))
+    }
+    if (cmp > 0) {
+      warning(sprintf("Installed %s@%s (>= pinned %s); proceeding", pkg, installed_now, target_version))
     }
   }
 }
