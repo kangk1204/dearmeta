@@ -48,17 +48,18 @@ These are commonly needed when compiling R or Python dependencies.
    cd dearmeta
    ```
 
-2. **Run the bootstrap script (installs Python + R deps)**
+2. **Create and activate a virtual environment (recommended)**
+   ```bash
+   python3 -m venv .dearmeta
+   source .dearmeta/bin/activate
+   ```
+   If you already have an environment active, skip this step.
+
+3. **Run the bootstrap script (installs Python + R deps)**
    ```bash
    bash scripts/bootstrap.sh
    ```
    This wraps the three manual steps (pip install, `renv::restore`, `scripts/install.R`). You only need to re-run it when dependencies change.
-
-3. *(Optional)* **Create/activate your own virtual environment**
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
 
 ## Quick Start
 
