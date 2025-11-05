@@ -118,7 +118,7 @@ prefetch_sesame_resources <- function() {
     message("sesameData package is unavailable; skipping resource prefetch.")
     return(invisible(FALSE))
   }
-  required_titles <- c("KYCG.EPIC.Mask.20220123")
+  required_titles <- c("KYCG.EPIC.Mask.20220123", "idatSignature")
   for (title in required_titles) {
     message("Prefetching sesameData resource: ", title)
     tryCatch(

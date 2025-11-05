@@ -141,6 +141,7 @@ DETECTION_P_THRESHOLD <- 0.01  # [Aryee2014]
 MAX_SAMPLE_DETP_FAILURE <- 0.05  # [Fortin2017]
 POOBAH_FAILURE_THRESHOLD <- 0.05  # [Zhou2018]
 MIN_BATCH_GROUP_BALANCE_COUNT <- 1L
+SESAME_SUPPORT_RESOURCES <- c("idatSignature")
 
 normalize_name <- function(x) {
   tolower(gsub("[^A-Za-z0-9]+", "", x))
@@ -318,6 +319,42 @@ load_sesame_manifest <- function(candidates, verbose = FALSE) {
     }
   }
   list(ordering = NULL, controls = NULL, source = NULL, attempts = attempts)
+}
+
+cache_sesame_resource <- function(resource, announce = TRUE) {
+  if (!requireNamespace("sesameData", quietly = TRUE)) {
+    if (announce) {
+      log_message("sesameData package unavailable; cannot cache resource %s", resource)
+    }
+    return(FALSE)
+  }
+  tryCatch(
+    {
+      if (announce) {
+        log_message("Caching sesameData resource %s via sesameDataCache()...", resource)
+      }
+      suppressMessages(sesameDataCache(resource))
+      TRUE
+    },
+    error = function(e) {
+      if (announce) {
+        log_message("Unable to cache sesameData resource %s: %s", resource, conditionMessage(e))
+      }
+      FALSE
+    }
+  )
+}
+
+ensure_sesame_support_resources <- function(resources = SESAME_SUPPORT_RESOURCES) {
+  resources <- unique(resources[nzchar(resources)])
+  if (length(resources) == 0) {
+    return(invisible(FALSE))
+  }
+  cached_any <- FALSE
+  for (resource in resources) {
+    cached_any <- cache_sesame_resource(resource, announce = TRUE) || cached_any
+  }
+  invisible(cached_any)
 }
 
 sanitize_covariate <- function(x) {
@@ -3309,6 +3346,7 @@ save_matrix(detP, file.path(preprocess_dir, "detection_p_minfi.tsv.gz"))
 
 # ---- Sesame pipeline --------------------------------------------------------
 
+ensure_sesame_support_resources()
 log_message("Running sesame pipeline...")
 sesame_available <- TRUE
 sesame_error <- NULL
@@ -3329,6 +3367,7 @@ if (!is.null(manifest_info$ordering)) {
   sesame_manifest <- manifest_info$ordering
   sesame_controls <- manifest_info$controls
   sesame_manifest_source <- manifest_info$source
+  idat_signature_retry <- FALSE
   tryCatch(
     {
       for (i in seq_len(nrow(config))) {
@@ -3359,6 +3398,16 @@ if (!is.null(manifest_info$ordering)) {
               break
             }
             err_msg <- conditionMessage(sig)
+            if (!idat_signature_retry && grepl("idatSignature", err_msg, fixed = TRUE)) {
+              if (cache_sesame_resource("idatSignature", announce = TRUE)) {
+                idat_signature_retry <- TRUE
+                log_message(
+                  "Cached idatSignature after sesame failure; retrying sample %s",
+                  sample_id
+                )
+                next
+              }
+            }
             if (attempt == 1 && isTRUE(original_alt_repo) &&
               grepl("(cannot be retrieved|찾을 수 없습니다)", err_msg, ignore.case = TRUE)) {
               log_message(
