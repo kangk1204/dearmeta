@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 import requests
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, ConfigDict, validator
 
 from .files import download_file, ensure_dir, gunzip_file, compute_md5
 from .logging_utils import get_logger
@@ -20,6 +20,7 @@ GEO_FTP_BASE = "https://ftp.ncbi.nlm.nih.gov/geo/series"
 GEO_GPL_BASE = "https://ftp.ncbi.nlm.nih.gov/geo/platforms"
 
 IDAT_PATTERN = re.compile(r"/(GSM\d+)[^/]*_(Red|Grn)\.idat(\.gz)?$", re.IGNORECASE)
+MD5_HEX = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
 # Known GEO platform accessions for supported methylation arrays.
 PLATFORM_ID_ALIASES = {
@@ -32,6 +33,8 @@ PLATFORM_ID_ALIASES = {
 class SeriesMetadata(BaseModel):
     """Minimal GEO series metadata required for validation."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     gse: str
     title: str
     summary: Optional[str] = None
@@ -39,9 +42,6 @@ class SeriesMetadata(BaseModel):
     platform_ids: List[str] = Field(default_factory=list, alias="gpl")
     platform_titles: List[str] = Field(default_factory=list, alias="gpltitle")
     sample_count: int = Field(default=0, alias="n_samples")
-
-    class Config:
-        allow_population_by_field_name = True
 
     @validator("gse", pre=True)
     def _validate_gse(cls, value: str) -> str:
@@ -157,6 +157,8 @@ class IdatPair:
     green: str
     checksum_red: Optional[str] = None
     checksum_green: Optional[str] = None
+    size_red: Optional[int] = None
+    size_green: Optional[int] = None
 
 
 class GeoClient:
@@ -248,7 +250,14 @@ class GeoClient:
             raise RuntimeError(f"No series matrix found for {gse}")
         matrix_file = matrix_candidates[0]
         dest = target_dir / matrix_file
-        checksum = download_file(f"{self._matrix_url(gse)}/{matrix_file}", dest)
+        matrix_url = f"{self._matrix_url(gse)}/{matrix_file}"
+        size, expected_md5 = self._fetch_remote_metadata(matrix_url)
+        checksum = download_file(
+            matrix_url,
+            dest,
+            expected_md5=expected_md5,
+            expected_size=size,
+        )
         logger.info("Downloaded %s (md5=%s)", dest.name, checksum)
         extracted = gunzip_file(dest, remove_original=False)
         return extracted
@@ -264,7 +273,14 @@ class GeoClient:
             raise RuntimeError(f"Could not locate annotation file for {gpl}")
         annot = candidates[0]
         dest = destination_dir / annot
-        download_file(f"{url}{annot}", dest)
+        annot_url = f"{url}{annot}"
+        size, expected_md5 = self._fetch_remote_metadata(annot_url)
+        download_file(
+            annot_url,
+            dest,
+            expected_md5=expected_md5,
+            expected_size=size,
+        )
         return gunzip_file(dest, remove_original=False)
 
     def download_idat_pair(self, pair: IdatPair, dest_root: Path) -> IdatPair:
@@ -274,14 +290,26 @@ class GeoClient:
         green_path = target_dir / Path(pair.green).name
         reused_red, md5_red = _reuse_existing_idat(red_path)
         reused_green, md5_green = _reuse_existing_idat(green_path)
+        red_meta = self._fetch_remote_metadata(pair.red)
+        green_meta = self._fetch_remote_metadata(pair.green)
         if reused_red:
             logger.debug("Reusing existing IDAT archive %s", red_path)
         else:
-            md5_red = download_file(pair.red, red_path)
+            md5_red = download_file(
+                pair.red,
+                red_path,
+                expected_md5=red_meta[1],
+                expected_size=red_meta[0],
+            )
         if reused_green:
             logger.debug("Reusing existing IDAT archive %s", green_path)
         else:
-            md5_green = download_file(pair.green, green_path)
+            md5_green = download_file(
+                pair.green,
+                green_path,
+                expected_md5=green_meta[1],
+                expected_size=green_meta[0],
+            )
         extracted_red = gunzip_file(red_path)
         extracted_green = gunzip_file(green_path)
         return IdatPair(
@@ -290,6 +318,8 @@ class GeoClient:
             green=str(extracted_green),
             checksum_red=md5_red,
             checksum_green=md5_green,
+            size_red=red_meta[0],
+            size_green=green_meta[0],
         )
 
     # --- Internal helpers ---------------------------------------------------
@@ -346,11 +376,41 @@ class GeoClient:
     def _matrix_url(self, gse: str) -> str:
         return f"{self._series_base(gse)}/matrix"
 
+    def _fetch_remote_metadata(self, url: str) -> Tuple[Optional[int], Optional[str]]:
+        """Return (size_bytes, md5_from_etag) if exposed by the remote server."""
+        try:
+            response = self.session.head(url, allow_redirects=True, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException:
+            logger.debug("Metadata lookup failed for %s", url)
+            return (None, None)
+        size_header = response.headers.get("Content-Length")
+        etag = response.headers.get("ETag") or response.headers.get("Etag")
+        md5 = _md5_from_etag(etag) if etag else None
+        try:
+            size_value = int(size_header) if size_header else None
+        except (TypeError, ValueError):
+            size_value = None
+        return (size_value, md5)
+
 
 def _normalise_geo_url(url: str) -> str:
     if url.startswith("ftp://"):
         return "https://" + url[len("ftp://") :]
     return url
+
+
+def _md5_from_etag(etag: Optional[str]) -> Optional[str]:
+    if not etag:
+        return None
+    value = etag.strip().strip('"')
+    if value.startswith("W/"):
+        value = value[2:].strip('"')
+    for candidate in re.split(r"-", value):
+        candidate = candidate.strip('"')
+        if MD5_HEX.fullmatch(candidate):
+            return candidate.lower()
+    return None
 
 
 def _reuse_existing_idat(path: Path) -> Tuple[bool, Optional[str]]:

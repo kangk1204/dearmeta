@@ -65,6 +65,121 @@ def build_structure(root: Path) -> dict:
     return paths
 
 
+def _format_mapping(mapping: dict[str, object] | list | tuple | None) -> str:
+    if not mapping:
+        return "none"
+    if isinstance(mapping, dict):
+        return "; ".join(f"{key}={value}" for key, value in mapping.items()) or "none"
+    if isinstance(mapping, (list, tuple, set)):
+        items = [str(item) for item in mapping if str(item)]
+        return ", ".join(items) if items else "none"
+    return str(mapping)
+
+
+def generate_markdown_summary(summary_path: Path) -> Path:
+    """Render a concise Markdown summary next to analysis_summary.json."""
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Missing analysis summary at {summary_path}")
+
+    summary = json.loads(summary_path.read_text())
+    lines: list[str] = []
+
+    gse = summary.get("gse", "unknown")
+    lines.append(f"# DearMeta Summary · {gse}")
+    lines.append("")
+
+    samples = summary.get("samples")
+    groups = summary.get("groups", {})
+    lines.append("## Cohort")
+    if samples is not None:
+        lines.append(f"- Samples analysed: {samples}")
+    if groups:
+        lines.append(f"- Group counts: {_format_mapping(groups)}")
+
+    sample_qc = summary.get("sample_qc", {})
+    det = sample_qc.get("detection", {}) if isinstance(sample_qc, dict) else {}
+    sesame_qc = sample_qc.get("sesame", {}) if isinstance(sample_qc, dict) else {}
+    lines.append("- Detection QC threshold: {}".format(det.get("threshold", "n/a")))
+    dropped_det = det.get("dropped") or []
+    lines.append(f"- Samples dropped (detection): {_format_mapping(dropped_det)}")
+    flagged_sesame = sesame_qc.get("flagged") or []
+    dropped_sesame = sesame_qc.get("dropped") or []
+    lines.append(f"- Sesame flagged (> {sesame_qc.get('threshold', 'n/a')}): {_format_mapping(flagged_sesame)}")
+    if dropped_sesame:
+        lines.append(f"- Sesame QC dropped: {_format_mapping(dropped_sesame)}")
+
+    probe_filters = summary.get("probe_filters", {})
+    if probe_filters:
+        lines.append("")
+        lines.append("## Probe Filtering")
+        for key in ["total_probes_raw", "after_detection", "after_snp", "after_autosome", "final_probes"]:
+            if key in probe_filters:
+                lines.append(f"- {key.replace('_', ' ').title()}: {probe_filters[key]}")
+
+    covariates = summary.get("covariates", {})
+    manual_covariates = summary.get("manual_covariates", {})
+    lines.append("")
+    lines.append("## Design")
+    lines.append(f"- Covariates (numeric): {_format_mapping(covariates.get('numeric'))}")
+    lines.append(f"- Covariates (factor): {_format_mapping(covariates.get('factor'))}")
+    if manual_covariates:
+        lines.append(f"- Manual covariates: {_format_mapping(manual_covariates)}")
+    batch_methods = summary.get("batch_methods", {})
+    if batch_methods:
+        lines.append(f"- Batch correction: {_format_mapping(batch_methods)}")
+    combat = summary.get("combat_models", {})
+    if combat:
+        lines.append(
+            f"- ComBat attempts: {combat.get('attempted', 0)} (success {combat.get('succeeded', 0)})"
+        )
+        failures = combat.get("failure_messages") or []
+        if failures:
+            lines.append(f"  - Failure notes: {_format_mapping(failures)}")
+
+    candidate_batches = summary.get("candidate_batches", {})
+    if candidate_batches:
+        lines.append(f"- Candidate batch columns: {_format_mapping(candidate_batches.get('final'))}")
+        diag = candidate_batches.get("diagnostics")
+        if diag:
+            lines.append(f"  - Batch diagnostics: {_format_mapping(diag)}")
+
+    significant = summary.get("significant_cpgs", {})
+    if significant:
+        lines.append("")
+        lines.append("## Differential CpGs")
+        lines.append(f"- minfi: {significant.get('minfi', 'n/a')}")
+        lines.append(f"- sesame: {significant.get('sesame', 'n/a')}")
+        lines.append(f"- intersection: {significant.get('intersection', 'n/a')}")
+
+    output_path = summary_path.with_suffix(".md")
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path
+
+
+def load_configure_dataframe(path: Path) -> pd.DataFrame:
+    """Load configure.tsv, tolerating comment-prefixed header rows."""
+    df = pd.read_csv(path, sep="\t", comment="#", encoding="utf-8-sig")
+    if "dear_group" in df.columns:
+        return df
+    header_row = None
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for idx, line in enumerate(handle):
+            stripped = line.strip()
+            clean = stripped.lstrip("\"").strip()
+            if not clean or clean.startswith("#"):
+                continue
+            first_field = clean.split("\t", 1)[0].strip().strip('"\'').lower()
+            if first_field == "dear_group":
+                header_row = idx
+                break
+    if header_row is None:
+        raise typer.BadParameter("Unable to locate 'dear_group' header in configure.tsv")
+    df = pd.read_csv(path, sep="\t", comment="#", header=header_row, encoding="utf-8-sig")
+    if "dear_group" not in df.columns:
+        raise typer.BadParameter("configure.tsv missing 'dear_group' column")
+    return df
+
+
 @app.command()
 def download(
     gse: str = typer.Option(..., "--gse", help="GEO series accession (e.g. GSE123456)."),
@@ -203,9 +318,26 @@ def analysis(
         help="Path to the analysis R script. Defaults to the packaged resource.",
     ),
     top_n_cpgs: int = typer.Option(10000, help="Number of CpGs to retain (sorted by p-value) for plots and tables."),
+    drop_sesame_failed: bool = typer.Option(
+        False, help="Drop samples whose sesame pOOBAH failure rate exceeds the threshold."
+    ),
+    poobah_threshold: float = typer.Option(
+        0.05,
+        help="Threshold for sesame pOOBAH failure rate; used for flagging/dropping samples.",
+    ),
+    cell_comp_reference: str = typer.Option(
+        "auto",
+        help="Cell composition reference ('auto', 'blood', or 'none'). Auto enables inference for blood datasets only.",
+    ),
 ) -> None:
     """Run the R-based analysis pipeline using prepared configure.tsv."""
     gse = validate_gse(gse)
+    if not (0 < poobah_threshold < 1):
+        raise typer.BadParameter("--poobah-threshold must be between 0 and 1")
+    valid_cell_refs = {"auto", "blood", "none"}
+    normalized_cell_ref = cell_comp_reference.strip().lower()
+    if normalized_cell_ref not in valid_cell_refs:
+        raise typer.BadParameter("--cell-comp-reference must be one of: auto, blood, none")
     root = Path.cwd() / gse
     paths = build_structure(root)
     pipeline_log = paths["runtime"] / "pipeline.log"
@@ -233,7 +365,7 @@ def analysis(
             script_path = r_script.resolve()
 
         logger.info("Loading configure TSV from %s", configure_path)
-        config_df = pd.read_csv(configure_path, sep="\t", comment="#")
+        config_df = load_configure_dataframe(configure_path)
         config_df["dear_group"] = config_df["dear_group"].astype("string").str.strip()
         retained = config_df[config_df["dear_group"].notna() & (config_df["dear_group"] != "")].copy()
 
@@ -258,9 +390,18 @@ def analysis(
 
         logger.info("Running R analysis for %s with %s samples", gse, retained.shape[0])
         logger.debug("Using R script at %s", script_path)
-        extra_args = ["--top-n-cpgs", str(top_n_cpgs)]
+        extra_args = [
+            "--top-n-cpgs",
+            str(top_n_cpgs),
+            "--poobah-threshold",
+            str(poobah_threshold),
+            "--cell-comp-reference",
+            normalized_cell_ref,
+        ]
         if normalized_group_ref:
             extra_args.extend(["--group-ref", normalized_group_ref])
+        if drop_sesame_failed:
+            extra_args.append("--drop-sesame-failed")
         env = {"DEARMETA_GROUPS_JSON": json.dumps(group_sizes.to_dict())}
         if normalized_group_ref:
             env["DEARMETA_GROUP_REFERENCE"] = normalized_group_ref
@@ -273,7 +414,25 @@ def analysis(
             extra_args=extra_args,
             env=env,
         )
-    console.print(f"[bold green]Analysis complete[/] for {gse}. See runtime/analysis_summary.json for details.")
+    summary_json = paths["runtime"] / "analysis_summary.json"
+    summary_md: Optional[Path] = None
+    if summary_json.exists():
+        try:
+            summary_md = generate_markdown_summary(summary_json)
+        except Exception as exc:  # pragma: no cover - best effort summary rendering
+            logger.warning("Failed to render Markdown summary for %s: %s", gse, exc)
+    else:
+        logger.warning("analysis_summary.json missing at %s", summary_json)
+
+    console.print(
+        f"[bold green]Analysis complete[/] for {gse}. See runtime/analysis_summary.json for details."
+    )
+    if summary_md is not None:
+        try:
+            rel_path = summary_md.relative_to(Path.cwd())
+        except ValueError:
+            rel_path = summary_md
+        console.print(f"[dim]Markdown summary written to {rel_path}[/]")
 
 
 def main() -> None:

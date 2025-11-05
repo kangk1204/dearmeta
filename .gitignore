@@ -44,6 +44,7 @@ htmlcov/
 .RData
 .Rproj.user/
 *.Rproj
+.Rprofile
 
 # Local environment files
 .env
@@ -51,6 +52,8 @@ htmlcov/
 
 # R session history
 .Rhistory
+renv/library/
+renv/staging/
 
 # Editor settings
 .vscode/

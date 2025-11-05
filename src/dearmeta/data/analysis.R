@@ -37,7 +37,10 @@ option_list <- list(
   make_option("--group-ref", type = "character", dest = "group_ref", default = NULL, help = "Group label to use as the reference/baseline for contrasts"),
   make_option("--fdr-threshold", type = "double", dest = "fdr_threshold", default = 0.05, help = "Adjusted p-value threshold"),
   make_option("--delta-beta-threshold", type = "double", dest = "delta_beta_threshold", default = 0.05, help = "Absolute delta-beta threshold"),
-  make_option("--top-n-cpgs", type = "integer", dest = "top_n_cpgs", default = 10000, help = "Number of CpGs to retain for plots/tables")
+  make_option("--top-n-cpgs", type = "integer", dest = "top_n_cpgs", default = 10000, help = "Number of CpGs to retain for plots/tables"),
+  make_option("--poobah-threshold", type = "double", dest = "poobah_threshold", default = 0.05, help = "Sesame pOOBAH failure threshold."),
+  make_option("--drop-sesame-failed", action = "store_true", dest = "drop_sesame_failed", default = FALSE, help = "Drop samples exceeding the sesame pOOBAH threshold."),
+  make_option("--cell-comp-reference", type = "character", dest = "cell_comp_reference", default = "auto", help = "Cell composition reference (auto, blood, none).")
 )
 
 opt <- parse_args(OptionParser(option_list = option_list))
@@ -55,6 +58,17 @@ if (is.null(opt$top_n_cpgs) || length(opt$top_n_cpgs) == 0) {
   if (is.na(opt$top_n_cpgs) || opt$top_n_cpgs <= 0) {
     stop("--top-n-cpgs must be a positive integer")
   }
+}
+
+if (is.null(opt$poobah_threshold) || !is.finite(opt$poobah_threshold) || opt$poobah_threshold <= 0 || opt$poobah_threshold >= 1) {
+  stop("--poobah-threshold must be between 0 and 1")
+}
+
+POOBAH_FAILURE_THRESHOLD <- opt$poobah_threshold
+drop_sesame_failed <- isTRUE(opt$drop_sesame_failed)
+cell_comp_reference <- tolower(opt$cell_comp_reference %||% "auto")
+if (!cell_comp_reference %in% c("auto", "blood", "none")) {
+  stop("--cell-comp-reference must be one of: auto, blood, none")
 }
 
 project_root <- normalizePath(opt$project_root, mustWork = TRUE)
@@ -119,9 +133,14 @@ group_reference <- NA_character_
 
 DEFAULT_PROTECTED_BATCH <- c("sex", "gender", "sex_at_birth", "biological_sex")
 PROTECTED_BATCH_PATTERNS <- c("sex", "gender")
-BATCH_TARGET_MEDIAN_P <- 0.8
-MIN_BATCH_NONMISSING_RATIO <- 0.5
-MIN_BATCH_LEVEL_SIZE <- 2L
+BATCH_TARGET_MEDIAN_P <- 0.8  # [Leek2012]
+MIN_BATCH_NONMISSING_RATIO <- 0.5  # [Johnson2007]
+MIN_BATCH_LEVEL_SIZE <- 2L  # limma user guide §9
+
+DETECTION_P_THRESHOLD <- 0.01  # [Aryee2014]
+MAX_SAMPLE_DETP_FAILURE <- 0.05  # [Fortin2017]
+POOBAH_FAILURE_THRESHOLD <- 0.05  # [Zhou2018]
+MIN_BATCH_GROUP_BALANCE_COUNT <- 1L
 
 normalize_name <- function(x) {
   tolower(gsub("[^A-Za-z0-9]+", "", x))
@@ -187,13 +206,24 @@ log_message("DearMeta analysis launched for", opt$gse)
 
 read_configure <- function(path, project_root) {
   raw_lines <- readLines(path)
-  directive_lines <- raw_lines[grepl("^\\s*#", raw_lines)]
-  data_lines <- raw_lines[!grepl("^\\s*#", raw_lines)]
-  directives <- parse_config_directives(directive_lines)
-  if (length(data_lines) == 0) {
-    stop("configure.tsv contains no data rows.")
+  is_comment <- grepl("^\\s*\"?#", raw_lines)
+  directive_lines <- raw_lines[is_comment]
+  header_idx <- which(grepl("^\\s*\"?dear_group\"?(\\t|$)", tolower(raw_lines)))
+  if (length(header_idx) == 0) {
+    stop("configure.tsv must contain a dear_group column.")
   }
-  cfg <- fread(text = paste(data_lines, collapse = "\n"), sep = "\t", na.strings = c("", "NA"))
+  skip_rows <- header_idx[1] - 1
+  directives <- parse_config_directives(directive_lines)
+  cfg <- fread(
+    input = path,
+    sep = "\t",
+    skip = skip_rows,
+    header = TRUE,
+    na.strings = c("", "NA"),
+    quote = "\"",
+    encoding = "UTF-8"
+  )
+  setnames(cfg, trimws(gsub("^\"|\"$", "", names(cfg))))
   if (!"dear_group" %in% names(cfg)) {
     stop("configure.tsv must contain a dear_group column.")
   }
@@ -244,16 +274,44 @@ load_sesame_manifest <- function(candidates, verbose = FALSE) {
   if (length(entries) == 0) {
     return(list(ordering = NULL, controls = NULL, source = NULL, attempts = attempts))
   }
-  for (entry in entries) {
-    result <- tryCatch(
-      sesameDataGet(entry, verbose = verbose),
-      error = function(e) {
-        attempts[[entry]] <<- conditionMessage(e)
-        NULL
-      }
+  fetch_manifest <- function(entry) {
+    tryCatch(
+      list(result = sesameDataGet(entry, verbose = verbose), error = NULL),
+      error = function(e) list(result = NULL, error = conditionMessage(e))
     )
-    if (is.list(result) && all(c("ordering", "controls") %in% names(result))) {
-      return(list(ordering = result$ordering, controls = result$controls, source = entry, attempts = attempts))
+  }
+  cache_manifest <- function(entry) {
+    tryCatch(
+      {
+        log_message("Attempting to cache sesame data resource %s via sesameDataCache()...", entry)
+        suppressMessages(sesameDataCache(entry))
+        NULL
+      },
+      error = function(e) conditionMessage(e)
+    )
+  }
+  for (entry in entries) {
+    fetch <- fetch_manifest(entry)
+    if (!is.null(fetch$error)) {
+      attempts[[entry]] <- c(attempts[[entry]] %||% character(), fetch$error)
+    }
+    result <- fetch$result
+    if (is.null(result)) {
+      cache_error <- cache_manifest(entry)
+      if (is.null(cache_error)) {
+        attempts[[entry]] <- c(attempts[[entry]] %||% character(), "Resource cached via sesameDataCache; retrying load.")
+        fetch_retry <- fetch_manifest(entry)
+        if (!is.null(fetch_retry$error)) {
+          attempts[[entry]] <- c(attempts[[entry]] %||% character(), fetch_retry$error)
+        }
+        result <- fetch_retry$result
+      } else {
+        attempts[[entry]] <- c(attempts[[entry]] %||% character(), sprintf("sesameDataCache failed: %s", cache_error))
+      }
+    }
+    if (is.list(result) && "ordering" %in% names(result)) {
+      controls_obj <- if ("controls" %in% names(result)) result$controls else NULL
+      return(list(ordering = result$ordering, controls = controls_obj, source = entry, attempts = attempts))
     }
     if (!is.null(result) && is.null(attempts[[entry]])) {
       attempts[[entry]] <- "Dataset lacks ordering/controls manifest."
@@ -290,6 +348,61 @@ has_sufficient_batch_support <- function(values, total_rows, min_ratio = MIN_BAT
   }
   counts <- table(values)
   length(counts) >= 2 && all(counts >= min_level_size)
+}
+
+has_group_batch_balance <- function(group_values, batch_values, min_per_cell = MIN_BATCH_GROUP_BALANCE_COUNT) {
+  group_values <- sanitize_covariate(group_values)
+  batch_values <- sanitize_covariate(batch_values)
+  mask <- !is.na(group_values) & !is.na(batch_values)
+  if (sum(mask) < 4) {
+    return(FALSE)
+  }
+  tab <- table(group_values[mask], batch_values[mask])
+  if (nrow(tab) < 2 || ncol(tab) < 2) {
+    return(FALSE)
+  }
+  group_per_batch <- apply(tab >= min_per_cell, 2, sum)
+  batch_per_group <- apply(tab >= min_per_cell, 1, sum)
+  all(group_per_batch >= 2) && all(batch_per_group >= 2)
+}
+
+describe_group_batch_imbalance <- function(group_values, batch_values, min_per_cell = MIN_BATCH_GROUP_BALANCE_COUNT) {
+  group_values <- sanitize_covariate(group_values)
+  batch_values <- sanitize_covariate(batch_values)
+  mask <- !is.na(group_values) & !is.na(batch_values)
+  if (sum(mask) == 0) {
+    return(list())
+  }
+  tab <- table(group_values[mask], batch_values[mask])
+  missing_groups <- apply(tab, 2, function(col) {
+    rownames(tab)[col < min_per_cell]
+  })
+  missing_batches <- apply(tab, 1, function(row) {
+    colnames(tab)[row < min_per_cell]
+  })
+  group_detail <- list()
+  if (!is.null(missing_groups)) {
+    for (idx in seq_along(missing_groups)) {
+      groups <- missing_groups[[idx]]
+      if (length(groups) > 0) {
+        group_detail[[length(group_detail) + 1L]] <- list(batch = names(missing_groups)[idx], groups = as.vector(groups))
+      }
+    }
+  }
+  batch_detail <- list()
+  if (!is.null(missing_batches)) {
+    for (idx in seq_along(missing_batches)) {
+      batches <- missing_batches[[idx]]
+      if (length(batches) > 0) {
+        batch_detail[[length(batch_detail) + 1L]] <- list(group = names(missing_batches)[idx], batches = as.vector(batches))
+      }
+    }
+  }
+  list(
+    counts = as.data.frame.matrix(tab),
+    underrepresented_groups_by_batch = group_detail,
+    underrepresented_batches_by_group = batch_detail
+  )
 }
 
 duplicates_dear_group <- function(group_values, candidate_values) {
@@ -342,6 +455,11 @@ remove_group_duplicates <- function(columns, cfg, group_col = "dear_group", log_
 detect_candidate_batches <- function(cfg, protect_cols = character()) {
   ignore_cols <- c("dear_group", "gsm_id", "sample_name", "idat_red", "idat_grn", "platform_version", "species")
   candidates <- character(0)
+  diagnostics <- list(
+    excluded_support = character(),
+    excluded_confounded = character(),
+    excluded_confounded_detail = list()
+  )
   keywords <- c("slide", "barcode", "sentrix", "array", "plate", "batch", "center", "processing", "chip", "position")
   protected_lower <- tolower(protect_cols)
   total_rows <- nrow(cfg)
@@ -354,6 +472,12 @@ detect_candidate_batches <- function(cfg, protect_cols = character()) {
       next
     }
     if (!has_sufficient_batch_support(values, total_rows)) {
+      diagnostics$excluded_support <- unique(c(diagnostics$excluded_support, col))
+      next
+    }
+    if (!has_group_batch_balance(cfg$dear_group, values, min_per_cell = MIN_BATCH_GROUP_BALANCE_COUNT)) {
+      diagnostics$excluded_confounded <- unique(c(diagnostics$excluded_confounded, col))
+      diagnostics$excluded_confounded_detail[[col]] <- describe_group_batch_imbalance(cfg$dear_group, values, MIN_BATCH_GROUP_BALANCE_COUNT)
       next
     }
     non_missing <- sum(!is.na(values))
@@ -365,7 +489,9 @@ detect_candidate_batches <- function(cfg, protect_cols = character()) {
       candidates <- c(candidates, col)
     }
   }
-  unique(candidates)
+  result <- unique(candidates)
+  attr(result, "diagnostics") <- diagnostics
+  result
 }
 
 split_covariates <- function(cfg, batch_cols, protected_cols = character()) {
@@ -450,6 +576,41 @@ make_group_factor <- function(values) {
   f
 }
 
+build_group_contrast_table <- function(group_levels, group_columns) {
+  if (length(group_levels) < 2 || length(group_columns) == 0) {
+    return(data.table())
+  }
+  mapping_levels <- group_levels[-1]
+  column_map <- setNames(group_columns, mapping_levels[seq_along(group_columns)])
+  baseline <- group_levels[1]
+  contrast_rows <- data.table(
+    coef = unname(column_map),
+    contrast_formula = NA_character_,
+    reference_group = baseline,
+    target_group = names(column_map),
+    comparison = sprintf("%s_vs_%s", names(column_map), baseline)
+  )
+  if (length(mapping_levels) > 1) {
+    combos <- utils::combn(mapping_levels, 2, simplify = FALSE)
+    if (length(combos) > 0) {
+      extra <- rbindlist(
+        lapply(combos, function(pair) {
+          list(
+            coef = NA_character_,
+            contrast_formula = sprintf("%s - %s", column_map[[pair[1]]], column_map[[pair[2]]]),
+            reference_group = pair[2],
+            target_group = pair[1],
+            comparison = sprintf("%s_vs_%s", pair[1], pair[2])
+          )
+        }),
+        fill = TRUE
+      )
+      contrast_rows <- rbind(contrast_rows, extra, fill = TRUE)
+    }
+  }
+  contrast_rows[]
+}
+
 construct_design <- function(groups, numeric_covars, factor_covars, data, surrogate = NULL) {
   group_factor <- make_group_factor(groups)
   df <- data.table(group = group_factor)
@@ -463,21 +624,26 @@ construct_design <- function(groups, numeric_covars, factor_covars, data, surrog
     df <- cbind(df, surrogate)
   }
   design <- model.matrix(~ ., data = df)
+  original_colnames <- colnames(design)
+  sanitized_colnames <- make.names(original_colnames)
+  intercept_idx <- which(original_colnames == "(Intercept)")
+  if (length(intercept_idx) == 1) {
+    sanitized_colnames[intercept_idx] <- "(Intercept)"
+  }
+  colnames(design) <- sanitized_colnames
   group_levels <- levels(group_factor)
   group_cols <- grep("^group", colnames(design), value = TRUE)
-  if (length(group_levels) >= 2 && length(group_cols) >= 1) {
-    usable <- seq_len(min(length(group_levels) - 1L, length(group_cols)))
-    contrast_info <- data.table(
-      coef = group_cols[usable],
-      reference_group = group_levels[1],
-      target_group = group_levels[-1][usable]
-    )
-    contrast_info[, comparison := sprintf("%s_vs_%s", target_group, reference_group)]
-    attr(design, "group_contrasts") <- contrast_info
-  } else {
-    attr(design, "group_contrasts") <- data.table()
+  if (length(group_cols) == length(group_levels) - 1) {
+    names(group_cols) <- group_levels[-1]
   }
   attr(design, "group_levels") <- group_levels
+  attr(design, "group_columns") <- group_cols
+  if (length(group_levels) >= 2 && length(group_cols) >= 1) {
+    contrast_info <- build_group_contrast_table(group_levels, group_cols)
+  } else {
+    contrast_info <- data.table()
+  }
+  attr(design, "group_contrasts") <- contrast_info
   attr(design, "reference_group") <- if (length(group_levels) > 0) group_levels[1] else NA_character_
   design
 }
@@ -508,6 +674,119 @@ apply_combat <- function(M_matrix, metadata, batch_col, design) {
   rownames(combat_res) <- rownames(M_matrix)
   colnames(combat_res) <- colnames(M_matrix)
   combat_res
+}
+
+detect_blood_signal <- function(metadata) {
+  candidate_cols <- names(metadata)[vapply(metadata, function(col) is.character(col) || is.factor(col), logical(1))]
+  if (length(candidate_cols) == 0) {
+    return(FALSE)
+  }
+  for (col in candidate_cols) {
+    values <- metadata[[col]]
+    if (is.null(values)) {
+      next
+    }
+    if (any(grepl("blood|pbmc|buffy", values, ignore.case = TRUE), na.rm = TRUE)) {
+      return(TRUE)
+    }
+  }
+  FALSE
+}
+
+infer_cell_reference <- function(metadata, option) {
+  option <- tolower(option %||% "auto")
+  if (option == "blood") {
+    return("blood")
+  }
+  if (option == "none") {
+    return("none")
+  }
+  if (detect_blood_signal(metadata)) {
+    return("blood")
+  }
+  "none"
+}
+
+estimate_cell_composition <- function(rgset, metadata, platform_label, option, log_fn = log_message) {
+  summary <- list(status = "skipped", reason = "cell composition disabled")
+  if (is.null(rgset) || !inherits(rgset, "RGChannelSet")) {
+    summary <- list(status = "failed", reason = "RGChannelSet unavailable")
+    return(list(fractions = NULL, summary = summary))
+  }
+  reference <- infer_cell_reference(metadata, option)
+  if (reference != "blood") {
+    if (option == "blood") {
+      summary <- list(status = "failed", reason = "blood reference requested but not detected in metadata")
+    } else if (option == "auto") {
+      summary <- list(status = "skipped", reason = "auto detection skipped (no blood-like tissue)")
+    } else {
+      summary <- list(status = "skipped", reason = "cell composition disabled")
+    }
+    return(list(fractions = NULL, summary = summary))
+  }
+  reference_platform <- if (platform_label %in% c("EPICv1", "EPICv2")) "IlluminaHumanMethylationEPIC" else "IlluminaHumanMethylation450k"
+  ref_pkg <- if (reference_platform == "IlluminaHumanMethylationEPIC") "FlowSorted.Blood.EPIC" else "FlowSorted.Blood.450k"
+  if (!requireNamespace(ref_pkg, quietly = TRUE)) {
+    if (!is.null(log_fn)) {
+      log_fn("Cell composition skipped: Bioconductor package %s is not installed.", ref_pkg)
+    }
+    summary <- list(status = "failed", reason = sprintf("Package %s not installed", ref_pkg))
+    return(list(fractions = NULL, summary = summary))
+  }
+  counts_obj <- tryCatch(
+    minfi::estimateCellCounts2(
+      rgset,
+      compositeCellType = "Blood",
+      processMethod = "preprocessNoob",
+      probeSelect = "auto",
+      referencePlatform = reference_platform,
+      returnAll = FALSE,
+      meanPlot = FALSE,
+      verbose = FALSE
+    ),
+    error = function(e) e
+  )
+  if (inherits(counts_obj, "error")) {
+    if (!is.null(log_fn)) {
+      log_fn("Cell composition estimation failed: %s", conditionMessage(counts_obj))
+    }
+    summary <- list(status = "failed", reason = conditionMessage(counts_obj))
+    return(list(fractions = NULL, summary = summary))
+  }
+  counts_matrix <- counts_obj$counts
+  if (is.null(counts_matrix)) {
+    if (is.matrix(counts_obj)) {
+      counts_matrix <- counts_obj
+    } else {
+      summary <- list(status = "failed", reason = "Unexpected estimateCellCounts2 output")
+      return(list(fractions = NULL, summary = summary))
+    }
+  }
+  sample_names <- rownames(counts_matrix)
+  if (is.null(sample_names)) {
+    summary <- list(status = "failed", reason = "Cell count output missing rownames")
+    return(list(fractions = NULL, summary = summary))
+  }
+  align_idx <- match(metadata$gsm_id, sample_names)
+  if (any(is.na(align_idx))) {
+    summary <- list(status = "failed", reason = "Unable to align cell counts with metadata")
+    return(list(fractions = NULL, summary = summary))
+  }
+  counts_matrix <- counts_matrix[align_idx, , drop = FALSE]
+  cell_cols <- paste0("cell_", make.names(colnames(counts_matrix)))
+  frac_dt <- as.data.table(counts_matrix)
+  setnames(frac_dt, cell_cols)
+  summary <- list(
+    status = "ok",
+    method = "estimateCellCounts2",
+    reference = "blood",
+    platform = reference_platform,
+    columns = cell_cols
+  )
+  if (!is.null(log_fn)) {
+    log_fn("Estimated blood cell composition using %s (%s).", ref_pkg, reference_platform)
+  }
+  list(fractions = frac_dt, summary = summary)
 }
 
 covariate_association_stats <- function(metadata, group_col, numeric_covars = character(), factor_covars = character()) {
@@ -639,14 +918,30 @@ generate_covariate_sets <- function(required_numeric, required_factor, optional_
 build_batch_options <- function(metadata, group_col, manual_batches, candidate_batches, max_auto = 3) {
   manual <- unique(manual_batches)
   auto <- setdiff(candidate_batches, manual)
+  logged_invalid <- character()
+  log_invalid <- function(col, reason) {
+    if (!col %in% logged_invalid) {
+      log_message("Excluding batch column %s: %s", col, reason)
+      logged_invalid <<- c(logged_invalid, col)
+    }
+  }
   is_valid <- function(col) {
     if (is.null(col) || is.na(col) || !nzchar(col) || !col %in% names(metadata)) {
       return(FALSE)
     }
     if (duplicates_dear_group(metadata[[group_col]], metadata[[col]])) {
+      log_invalid(col, "duplicates dear_group")
       return(FALSE)
     }
-    has_sufficient_batch_support(metadata[[col]], nrow(metadata))
+    if (!has_sufficient_batch_support(metadata[[col]], nrow(metadata))) {
+      log_invalid(col, "insufficient replicated non-missing values")
+      return(FALSE)
+    }
+    if (!has_group_batch_balance(metadata[[group_col]], metadata[[col]], min_per_cell = MIN_BATCH_GROUP_BALANCE_COUNT)) {
+      log_invalid(col, "confounded with dear_group levels")
+      return(FALSE)
+    }
+    TRUE
   }
   if (length(manual) > 0) {
     manual <- manual[vapply(manual, is_valid, logical(1))]
@@ -1143,14 +1438,10 @@ resolve_group_contrasts <- function(design, metadata) {
   if (length(group_levels) < 2 || length(group_cols) == 0) {
     stop("Design matrix lacks usable dear_group contrasts.")
   }
-  usable <- seq_len(min(length(group_levels) - 1L, length(group_cols)))
-  info <- data.table(
-    coef = group_cols[usable],
-    reference_group = group_levels[1],
-    target_group = group_levels[-1][usable]
-  )
-  info[, comparison := sprintf("%s_vs_%s", target_group, reference_group)]
-  info
+  if (length(group_cols) == length(group_levels) - 1) {
+    names(group_cols) <- group_levels[-1]
+  }
+  build_group_contrast_table(group_levels, group_cols)
 }
 
 run_limma <- function(M_matrix, beta_matrix, metadata, design) {
@@ -1197,21 +1488,37 @@ run_limma <- function(M_matrix, beta_matrix, metadata, design) {
       beta_matrix <- beta_matrix[keep_var, , drop = FALSE]
     }
     log_message("run_limma[%s]: proceeding with %s probes", model_id, nrow(M_matrix))
-    fit <- lmFit(M_matrix, design)
-    fit <- eBayes(fit)
+    fit_base <- lmFit(M_matrix, design)
+    fit_main <- eBayes(fit_base)
     contrasts_info <- resolve_group_contrasts(design, metadata)
     metadata_groups <- make_group_factor(metadata$dear_group)
     results <- vector("list", nrow(contrasts_info))
     for (idx in seq_len(nrow(contrasts_info))) {
       contrast <- contrasts_info[idx]
       coef_name <- contrast$coef
-      log_message(
-        "run_limma[%s]: using coefficient %s for group comparison (%s)",
-        model_id,
-        coef_name,
-        contrast$comparison
-      )
-      top <- topTable(fit, coef = coef_name, number = nrow(M_matrix), sort.by = "P")
+      contrast_formula <- contrast$contrast_formula %||% NA_character_
+      if (!is.na(coef_name)) {
+        log_message(
+          "run_limma[%s]: using coefficient %s for group comparison (%s)",
+          model_id,
+          coef_name,
+          contrast$comparison
+        )
+        top <- topTable(fit_main, coef = coef_name, number = nrow(M_matrix), sort.by = "P")
+      } else if (!is.na(contrast_formula) && nzchar(contrast_formula)) {
+        log_message(
+          "run_limma[%s]: using contrast %s for group comparison (%s)",
+          model_id,
+          contrast_formula,
+          contrast$comparison
+        )
+        contrast_matrix <- makeContrasts(contrasts = contrast_formula, levels = colnames(design))
+        contrast_fit <- contrasts.fit(fit_base, contrast_matrix)
+        contrast_fit <- eBayes(contrast_fit)
+        top <- topTable(contrast_fit, coef = 1, number = nrow(M_matrix), sort.by = "P")
+      } else {
+        stop(sprintf("Contrast %s lacks coefficient or formula", contrast$comparison))
+      }
       top <- data.table(probe_id = rownames(top), top)
       available <- top$probe_id[top$probe_id %in% rownames(beta_matrix)]
       if (length(available) == 0) {
@@ -2228,6 +2535,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
   )
 
   interactive_sections <- list()
+  batch_covariate_cards <- list()
   if (length(interactive_files) > 0) {
     entries <- lapply(names(interactive_files), function(key) {
       meta <- interactive_output_metadata(key)
@@ -2284,6 +2592,8 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
     entries <- Filter(function(item) !is.null(item$card), entries)
     if (length(entries) > 0) {
       categories <- split(entries, vapply(entries, function(item) item$category %||% "Additional Outputs", character(1)))
+      batch_covariate_cards <- categories[["Batch & Covariates"]] %||% list()
+      categories[["Batch & Covariates"]] <- NULL
       category_order <- c("Quality Control", "Differential Analysis", "Genomic Context", "Annotated Tables", "Additional Outputs")
       ordered_names <- names(categories)[order(match(names(categories), category_order, nomatch = length(category_order) + 1))]
       interactive_sections <- lapply(ordered_names, function(name) {
@@ -2311,6 +2621,19 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
         do.call(htmltools::tagList, interactive_sections)
       )
     )
+  }
+
+  batch_covariate_section <- NULL
+  if (length(batch_covariate_cards) > 0) {
+    cards <- lapply(batch_covariate_cards, function(item) item$card)
+    cards <- Filter(Negate(is.null), cards)
+    if (length(cards) > 0) {
+      batch_covariate_section <- htmltools::tags$section(
+        class = "dm-section",
+        htmltools::tags$h2(class = "dm-section__title", "Batch & Covariates"),
+        htmltools::tags$div(class = "dm-link-grid", cards)
+      )
+    }
   }
 
   render_top_cpg_section <- function(label, rows) {
@@ -2458,6 +2781,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
     group_badges,
     sig_section,
     if (!is.null(overlap_sentence)) htmltools::tags$p(class = "dm-text-note", overlap_sentence),
+    batch_covariate_section,
     covariate_section,
     interactive_block,
     top_cpg_section,
@@ -2854,96 +3178,12 @@ if (!is.null(opt$group_ref) && nzchar(trimws(opt$group_ref))) {
 
 log_message("Loaded", nrow(config), "samples for analysis across groups:", paste(names(group_counts), group_counts, sep = "=", collapse = "; "))
 
-# Determine candidate batches and covariates
 directives <- attr(config, "directives")
 if (is.null(directives)) {
   directives <- list(batch = character(), protect = character(), drop = character(), numeric = character(), factor = character())
 }
 
-manual_batch_columns <- match_columns(names(config), directives$batch)
-if (length(directives$batch) > 0 && length(manual_batch_columns) < length(directives$batch)) {
-  missing <- setdiff(directives$batch, manual_batch_columns)
-  log_message("Requested batch columns not found in configure.tsv: %s", paste(missing, collapse = ", "))
-}
-if (length(manual_batch_columns) > 0) {
-  filtered_manual <- remove_group_duplicates(manual_batch_columns, config, log_prefix = "Batch candidate")
-  dropped_manual <- setdiff(manual_batch_columns, filtered_manual)
-  if (length(dropped_manual) > 0) {
-    log_message("Excluded manual batch columns duplicating dear_group: %s", paste(dropped_manual, collapse = ", "))
-  }
-  manual_batch_columns <- filtered_manual
-}
-
-auto_protected <- names(config)[vapply(names(config), matches_protected_pattern, logical(1))]
-protected_columns <- unique(c(match_columns(names(config), DEFAULT_PROTECTED_BATCH), match_columns(names(config), directives$protect), auto_protected))
-if (length(directives$protect) > 0 && length(match_columns(names(config), directives$protect)) < length(directives$protect)) {
-  missing_protect <- setdiff(directives$protect, match_columns(names(config), directives$protect))
-  if (length(missing_protect) > 0) {
-    log_message("Requested protected columns not found in configure.tsv: %s", paste(missing_protect, collapse = ", "))
-  }
-}
-protected_for_detection <- setdiff(protected_columns, manual_batch_columns)
-
-candidate_batches <- detect_candidate_batches(config, protected_for_detection)
-auto_batches <- candidate_batches
-if (length(manual_batch_columns) > 0) {
-  candidate_batches <- unique(c(manual_batch_columns, candidate_batches))
-  log_message("Including manual batch columns: %s", paste(manual_batch_columns, collapse = ", "))
-}
-if (length(auto_batches) > 0) {
-  auto_filtered <- remove_group_duplicates(auto_batches, config, log_prefix = "Batch candidate")
-  dropped_auto <- setdiff(auto_batches, auto_filtered)
-  if (length(dropped_auto) > 0) {
-    log_message("Removed auto-detected batch columns duplicating dear_group: %s", paste(dropped_auto, collapse = ", "))
-  }
-  auto_batches <- auto_filtered
-}
-if (length(candidate_batches) > 0) {
-  candidate_filtered <- remove_group_duplicates(candidate_batches, config, log_prefix = "Batch candidate")
-  candidate_dropped <- setdiff(candidate_batches, candidate_filtered)
-  if (length(candidate_dropped) > 0) {
-    log_message("Removed batch columns duplicating dear_group from final candidate list: %s", paste(candidate_dropped, collapse = ", "))
-  }
-  candidate_batches <- candidate_filtered
-}
-
-covars <- split_covariates(config, candidate_batches, protected_columns)
-dropped_covariates <- attr(covars, "dropped_covariates")
-if (length(dropped_covariates) > 0) {
-  log_message(
-    "Excluded covariates lacking usable variation: %s",
-    paste(sprintf("%s (%s)", names(dropped_covariates), unlist(dropped_covariates)), collapse = ", ")
-  )
-} else {
-  dropped_covariates <- list()
-}
-
-manual_numeric <- match_columns(names(config), directives$numeric)
-if (length(directives$numeric) > 0 && length(manual_numeric) < length(directives$numeric)) {
-  missing_numeric <- setdiff(directives$numeric, manual_numeric)
-  if (length(missing_numeric) > 0) {
-    log_message("Requested numeric covariates not found in configure.tsv: %s", paste(missing_numeric, collapse = ", "))
-  }
-}
-if (length(manual_numeric) > 0) {
-  covars$numeric <- unique(c(covars$numeric, manual_numeric))
-  log_message("Force-included numeric covariates: %s", paste(manual_numeric, collapse = ", "))
-}
-manual_factor <- match_columns(names(config), directives$factor)
-if (length(directives$factor) > 0 && length(manual_factor) < length(directives$factor)) {
-  missing_factor <- setdiff(directives$factor, manual_factor)
-  if (length(missing_factor) > 0) {
-    log_message("Requested factor covariates not found in configure.tsv: %s", paste(missing_factor, collapse = ", "))
-  }
-}
-if (length(manual_factor) > 0) {
-  covars$factor <- unique(c(covars$factor, manual_factor))
-  log_message("Force-included factor covariates: %s", paste(manual_factor, collapse = ", "))
-}
-attr(covars, "dropped_covariates") <- NULL
-batch_tracking <- list(auto = auto_batches, manual = manual_batch_columns, protected = protected_columns)
-manual_covariates <- list(numeric = manual_numeric, factor = manual_factor)
-
+# Determine candidate batches and covariates
 platform_values <- unique(config$platform_version)
 if (length(platform_values) != 1) {
   stop("Mixed platform_version values detected; DearMeta expects a single array type per run.")
@@ -2974,6 +3214,9 @@ if (is.null(platform_info)) {
 }
 log_message("Detected array platform:", platform_label)
 
+sample_qc_summary <- list()
+probe_filter_summary <- list()
+
 # ---- Load IDATs with minfi --------------------------------------------------
 
 log_message("Reading IDATs with minfi...")
@@ -2986,19 +3229,82 @@ targets <- data.frame(
 )
 RGset <- read.metharray.exp(targets = targets, force = TRUE)
 detP <- detectionP(RGset)
-failed_probes <- rowMeans(detP > 0.01)
+sample_fail_rate <- colMeans(detP > DETECTION_P_THRESHOLD)
+sample_qc_summary$detection <- list(
+  threshold = MAX_SAMPLE_DETP_FAILURE,
+  failure_rate = as.list(setNames(round(sample_fail_rate, 4), colnames(detP))),
+  mean_failure = if (length(sample_fail_rate) > 0) mean(sample_fail_rate) else NA_real_,
+  max_failure = if (length(sample_fail_rate) > 0) max(sample_fail_rate) else NA_real_,
+  dropped = character()
+)
+drop_samples <- names(sample_fail_rate)[sample_fail_rate > MAX_SAMPLE_DETP_FAILURE]
+if (length(drop_samples) > 0) {
+  log_message(
+    "minfi: dropping %s samples with detection failure rate > %.1f%% (p>%.3f): %s",
+    length(drop_samples),
+    MAX_SAMPLE_DETP_FAILURE * 100,
+    DETECTION_P_THRESHOLD,
+    paste(drop_samples, collapse = ", ")
+  )
+  keep_mask <- !(colnames(detP) %in% drop_samples)
+  if (sum(keep_mask) < 2) {
+    stop("Sample-level QC removed too many samples; DearMeta requires at least two samples post-QC.")
+  }
+  RGset <- RGset[, keep_mask]
+  detP <- detP[, keep_mask, drop = FALSE]
+  basenames <- basenames[keep_mask]
+  targets <- targets[keep_mask, , drop = FALSE]
+  sample_qc_summary$detection$dropped <- drop_samples
+  config <- config[gsm_id %in% targets$Sample_Name]
+  config <- config[match(targets$Sample_Name, config$gsm_id)]
+  group_counts <- table(config$dear_group)
+  if (any(group_counts < opt$min_group_size)) {
+    stop(
+      "Post-QC sample counts violate --min-group-size: ",
+      paste(names(group_counts[group_counts < opt$min_group_size]), collapse = ", ")
+    )
+  }
+  log_message(
+    "Post-QC sample counts: %s",
+    paste(names(group_counts), group_counts, sep = "=", collapse = "; ")
+  )
+}
+
+probe_filter_summary$total_probes_raw <- nrow(RGset)
+failed_probes <- rowMeans(detP > DETECTION_P_THRESHOLD)
 keep_probes <- failed_probes <= 0.1
-log_message("minfi: retaining", sum(keep_probes), "probes out of", length(keep_probes))
+probe_filter_summary$detection_threshold <- DETECTION_P_THRESHOLD
+probe_filter_summary$detection_failure <- list(
+  mean = if (length(failed_probes) > 0) mean(failed_probes) else NA_real_,
+  max = if (length(failed_probes) > 0) max(failed_probes) else NA_real_
+)
+probe_filter_summary$after_detection <- sum(keep_probes)
+log_message("minfi: retaining %s probes out of %s after detection filtering", sum(keep_probes), length(keep_probes))
 RGset_filtered <- RGset[keep_probes, ]
 MSet <- preprocessNoob(RGset_filtered)
-beta_minfi <- getBeta(MSet)
-if (is.null(rownames(beta_minfi))) {
-  rownames(beta_minfi) <- featureNames(MSet)
+GRSet <- ratioConvert(MSet, what = "both", keepCN = TRUE)
+GRSet <- mapToGenome(GRSet)
+probe_filter_summary$after_noob <- nrow(GRSet)
+GRSet <- dropLociWithSnps(GRSet, snps = c("CpG", "SBE"))
+probe_filter_summary$after_snp <- nrow(GRSet)
+if (probe_filter_summary$after_snp == 0) {
+  stop("All probes were removed after SNP filtering; aborting.")
 }
-M_minfi <- getM(MSet)
+autosome_mask <- !seqnames(GRSet) %in% c("chrX", "chrY")
+probe_filter_summary$removed_sex <- sum(!autosome_mask)
+GRSet <- GRSet[autosome_mask, ]
+probe_filter_summary$after_autosome <- nrow(GRSet)
+if (probe_filter_summary$after_autosome == 0) {
+  stop("All probes were removed after autosomal filtering; aborting.")
+}
+beta_minfi <- getBeta(GRSet)
+if (is.null(rownames(beta_minfi))) {
+  rownames(beta_minfi) <- featureNames(GRSet)
+}
+M_minfi <- getM(GRSet)
+MSet <- GRSet
 
 preprocess_dir <- paths$preprocess
-saveRDS(MSet, file = file.path(preprocess_dir, "minfi_MSet.rds"))
 save_matrix(detP, file.path(preprocess_dir, "detection_p_minfi.tsv.gz"))
 
 # ---- Sesame pipeline --------------------------------------------------------
@@ -3094,10 +3400,13 @@ if (!is.null(manifest_info$ordering)) {
       platform_label,
       paste(unique(attempted), collapse = ", ")
     )
-    detail <- paste(
-      sprintf("%s (%s)", names(manifest_info$attempts), unlist(manifest_info$attempts, use.names = FALSE)),
-      collapse = "; "
-    )
+    detail <- paste(unlist(lapply(names(manifest_info$attempts), function(name) {
+      msgs <- manifest_info$attempts[[name]] %||% ""
+      if (length(msgs) == 0) {
+        return(sprintf("%s (unknown error)", name))
+      }
+      sprintf("%s (%s)", name, msgs)
+    })), collapse = "; ")
     if (nzchar(detail)) {
       log_message("Sesame manifest lookup details: %s", detail)
     }
@@ -3116,18 +3425,346 @@ if (!is.null(manifest_info$ordering)) {
 if (sesame_available && length(sesame_betas) > 0) {
   beta_sesame <- do.call(cbind, sesame_betas)
   beta_sesame <- pmax(pmin(beta_sesame, 1 - 1e-6), 1e-6)
-  colnames(beta_sesame) <- names(sesame_betas)
+  base_colnames <- colnames(beta_minfi)
+  gsm_lookup <- setNames(base_colnames, sub("_.*$", "", base_colnames))
+  mapped_cols <- gsm_lookup[names(sesame_betas)]
+  missing_map <- is.na(mapped_cols)
+  if (any(missing_map)) {
+    fallback <- names(sesame_betas)[missing_map]
+    mapped_cols[missing_map] <- fallback
+    log_message(
+      "Sesame column mapping fallback for %s samples (no matching minfi column).",
+      sum(missing_map)
+    )
+  }
+  colnames(beta_sesame) <- mapped_cols
   sesame_poobah <- do.call(cbind, sesame_detp)
-  colnames(sesame_poobah) <- names(sesame_detp)
-  M_sesame <- log2(beta_sesame / (1 - beta_sesame))
-  save_matrix(sesame_poobah, file.path(preprocess_dir, "pOOBAH_sesame.tsv.gz"))
+  colnames(sesame_poobah) <- mapped_cols
+  sesame_fail_rate <- colMeans(sesame_poobah > POOBAH_FAILURE_THRESHOLD)
+  sesame_flagged <- names(sesame_fail_rate)[sesame_fail_rate > POOBAH_FAILURE_THRESHOLD]
+  sample_qc_summary$sesame <- list(
+    threshold = POOBAH_FAILURE_THRESHOLD,
+    failure_rate = as.list(setNames(round(sesame_fail_rate, 4), colnames(sesame_poobah))),
+    mean_failure = if (length(sesame_fail_rate) > 0) mean(sesame_fail_rate) else NA_real_,
+    max_failure = if (length(sesame_fail_rate) > 0) max(sesame_fail_rate) else NA_real_,
+    flagged = sesame_flagged,
+    dropped = character()
+  )
+  if (length(sesame_flagged) > 0) {
+    log_message(
+      "Sesame QC: flagged %s samples with pOOBAH failure rate > %.2f: %s",
+      length(sesame_flagged),
+      POOBAH_FAILURE_THRESHOLD,
+      paste(sesame_flagged, collapse = ", ")
+    )
+  }
+  drop_samples <- character()
+  if (drop_sesame_failed && length(sesame_flagged) > 0) {
+    map_flag_to_column <- function(identifier) {
+      if (identifier %in% colnames(beta_minfi)) {
+        return(identifier)
+      }
+      gsm_id <- sub("_.*$", "", identifier)
+      mapped <- gsm_lookup[[gsm_id]]
+      if (is.null(mapped) || is.na(mapped)) {
+        return(NA_character_)
+      }
+      mapped
+    }
+    mapped_drop_raw <- vapply(sesame_flagged, map_flag_to_column, character(1), USE.NAMES = FALSE)
+    drop_columns <- intersect(mapped_drop_raw[!is.na(mapped_drop_raw)], colnames(beta_minfi))
+    drop_samples_record <- sesame_flagged[!is.na(mapped_drop_raw)]
+    if (length(drop_columns) > 0) {
+      log_message(
+        "Dropping %s samples exceeding sesame pOOBAH threshold %.2f: %s",
+        length(drop_columns),
+        POOBAH_FAILURE_THRESHOLD,
+        paste(drop_samples_record, collapse = ", ")
+      )
+      keep_mask <- !(colnames(beta_minfi) %in% drop_columns)
+      if (sum(keep_mask) < 2) {
+        stop("Sesame QC drop leaves fewer than two samples; aborting analysis.")
+      }
+      beta_minfi <- beta_minfi[, keep_mask, drop = FALSE]
+      M_minfi <- M_minfi[, keep_mask, drop = FALSE]
+      MSet <- MSet[, keep_mask]
+      detP <- detP[, keep_mask, drop = FALSE]
+      basenames <- basenames[keep_mask]
+      targets <- targets[keep_mask, , drop = FALSE]
+      common_cols <- intersect(colnames(beta_sesame), colnames(beta_minfi))
+      if (!setequal(common_cols, colnames(beta_minfi))) {
+        missing_cols <- setdiff(colnames(beta_minfi), common_cols)
+        if (length(missing_cols) > 0) {
+          log_message(
+            "Sesame QC drop removed required samples (%s); disabling sesame outputs.",
+            paste(missing_cols, collapse = ", ")
+          )
+          sesame_available <- FALSE
+          beta_sesame <- NULL
+          M_sesame <- NULL
+          sesame_poobah <- NULL
+        } else {
+          beta_sesame <- beta_sesame[, common_cols, drop = FALSE]
+          sesame_poobah <- sesame_poobah[, common_cols, drop = FALSE]
+        }
+      } else {
+        beta_sesame <- beta_sesame[, colnames(beta_minfi), drop = FALSE]
+        sesame_poobah <- sesame_poobah[, colnames(beta_minfi), drop = FALSE]
+      }
+      sample_qc_summary$sesame$dropped <- drop_samples_record
+      drop_samples <- drop_samples_record
+      drop_gsms <- sub("_.*$", "", drop_samples_record)
+      config <- config[!config$gsm_id %in% drop_gsms, , drop = FALSE]
+      col_gsms_current <- sub("_.*$", "", colnames(beta_minfi))
+      config <- config[match(col_gsms_current, config$gsm_id), , drop = FALSE]
+      if (any(is.na(config$gsm_id))) {
+        stop("Failed to realign metadata after sesame QC drop.")
+      }
+      group_counts <- table(config$dear_group)
+      if (length(group_counts) == 0) {
+        stop("No samples remain after sesame QC drop.")
+      }
+      if (any(group_counts < opt$min_group_size)) {
+        stop(
+          "Post-sesame QC sample counts violate --min-group-size: ",
+          paste(names(group_counts[group_counts < opt$min_group_size]), collapse = ", ")
+        )
+      }
+      log_message(
+        "Post-sesame QC sample counts: %s",
+        paste(names(group_counts), group_counts, sep = "=", collapse = "; ")
+      )
+    }
+  }
+  if (is.null(beta_sesame) || ncol(beta_sesame) == 0) {
+    log_message("Sesame pipeline has no samples after QC; disabling sesame outputs.")
+    sesame_available <- FALSE
+    beta_sesame <- NULL
+    M_sesame <- NULL
+    sesame_poobah <- NULL
+  } else {
+    M_sesame <- log2(beta_sesame / (1 - beta_sesame))
+    common_probes <- intersect(rownames(beta_minfi), rownames(beta_sesame))
+    if (length(common_probes) == 0) {
+      log_message("Sesame pipeline shares no probes with minfi after filtering; disabling sesame outputs.")
+      sesame_available <- FALSE
+      beta_sesame <- NULL
+      M_sesame <- NULL
+      sesame_poobah <- NULL
+    } else {
+      if (length(common_probes) < nrow(beta_minfi)) {
+        removed_minfi <- length(setdiff(rownames(beta_minfi), common_probes))
+        if (removed_minfi > 0) {
+          log_message("Aligning probe sets: dropping %s minfi probes absent from sesame.", removed_minfi)
+        }
+        beta_minfi <- beta_minfi[common_probes, , drop = FALSE]
+        M_minfi <- M_minfi[common_probes, , drop = FALSE]
+        MSet <- MSet[common_probes, ]
+      }
+      if (length(common_probes) < nrow(beta_sesame)) {
+        removed_sesame <- length(setdiff(rownames(beta_sesame), common_probes))
+        if (removed_sesame > 0) {
+          log_message("Aligning probe sets: dropping %s sesame probes absent from minfi.", removed_sesame)
+        }
+        beta_sesame <- beta_sesame[common_probes, , drop = FALSE]
+        M_sesame <- M_sesame[common_probes, , drop = FALSE]
+        sesame_poobah <- sesame_poobah[common_probes, , drop = FALSE]
+      }
+      save_matrix(sesame_poobah, file.path(preprocess_dir, "pOOBAH_sesame.tsv.gz"))
+    }
+  }
 } else {
   sesame_available <- FALSE
   beta_sesame <- NULL
   M_sesame <- NULL
   sesame_poobah <- NULL
+  sample_qc_summary$sesame <- list(
+    threshold = POOBAH_FAILURE_THRESHOLD,
+    failure_rate = list(),
+    mean_failure = NA_real_,
+    max_failure = NA_real_,
+    flagged = character(),
+    dropped = character()
+  )
   log_message("Skipping sesame pipeline:", if (!is.null(sesame_error)) sesame_error else "unknown error")
 }
+
+probe_filter_summary$final_probes <- nrow(beta_minfi)
+saveRDS(MSet, file = file.path(preprocess_dir, "minfi_MSet.rds"))
+
+auto_protected <- names(config)[vapply(names(config), matches_protected_pattern, logical(1))]
+protected_columns <- unique(c(match_columns(names(config), DEFAULT_PROTECTED_BATCH), match_columns(names(config), directives$protect), auto_protected))
+if (length(directives$protect) > 0 && length(match_columns(names(config), directives$protect)) < length(directives$protect)) {
+  missing_protect <- setdiff(directives$protect, match_columns(names(config), directives$protect))
+  if (length(missing_protect) > 0) {
+    log_message("Requested protected columns not found in configure.tsv: %s", paste(missing_protect, collapse = ", "))
+  }
+}
+
+batch_diagnostics <- list(
+  excluded_support = character(),
+  excluded_confounded = character(),
+  excluded_confounded_detail = list(),
+  manual_excluded = character(),
+  manual_insufficient = character(),
+  manual_confounded_detail = list()
+)
+
+manual_batch_columns <- match_columns(names(config), directives$batch)
+if (length(directives$batch) > 0 && length(manual_batch_columns) < length(directives$batch)) {
+  missing <- setdiff(directives$batch, manual_batch_columns)
+  log_message("Requested batch columns not found in configure.tsv: %s", paste(missing, collapse = ", "))
+}
+if (length(manual_batch_columns) > 0) {
+  filtered_manual <- remove_group_duplicates(manual_batch_columns, config, log_prefix = "Manual batch")
+  dropped_manual <- setdiff(manual_batch_columns, filtered_manual)
+  if (length(dropped_manual) > 0) {
+    log_message("Excluded manual batch columns duplicating dear_group: %s", paste(dropped_manual, collapse = ", "))
+  }
+  manual_batch_columns <- filtered_manual
+  if (length(manual_batch_columns) > 0) {
+    manual_valid <- vapply(manual_batch_columns, function(col) {
+      values <- sanitize_covariate(config[[col]])
+      if (!has_sufficient_batch_support(values, nrow(config))) {
+        batch_diagnostics$manual_insufficient <<- unique(c(batch_diagnostics$manual_insufficient, col))
+        log_message("Manual batch column %s lacks replicated non-missing values and will be excluded.", col)
+        return(FALSE)
+      }
+      if (!has_group_batch_balance(config$dear_group, values, min_per_cell = MIN_BATCH_GROUP_BALANCE_COUNT)) {
+        batch_diagnostics$manual_excluded <<- unique(c(batch_diagnostics$manual_excluded, col))
+        batch_diagnostics$manual_confounded_detail[[col]] <<- describe_group_batch_imbalance(config$dear_group, values, MIN_BATCH_GROUP_BALANCE_COUNT)
+        log_message("Manual batch column %s is confounded with dear_group and will be excluded.", col)
+        return(FALSE)
+      }
+      TRUE
+    }, logical(1))
+    manual_batch_columns <- manual_batch_columns[manual_valid]
+  }
+}
+
+protected_for_detection <- setdiff(protected_columns, manual_batch_columns)
+
+candidate_detection <- detect_candidate_batches(config, protected_for_detection)
+det_diag <- attr(candidate_detection, "diagnostics")
+if (!is.null(det_diag)) {
+  if (!is.null(det_diag$excluded_support)) {
+    batch_diagnostics$excluded_support <- unique(c(batch_diagnostics$excluded_support, det_diag$excluded_support))
+  }
+  if (!is.null(det_diag$excluded_confounded)) {
+    batch_diagnostics$excluded_confounded <- unique(c(batch_diagnostics$excluded_confounded, det_diag$excluded_confounded))
+  }
+  if (!is.null(det_diag$excluded_confounded_detail) && length(det_diag$excluded_confounded_detail) > 0) {
+    for (nm in names(det_diag$excluded_confounded_detail)) {
+      batch_diagnostics$excluded_confounded_detail[[nm]] <- det_diag$excluded_confounded_detail[[nm]]
+    }
+  }
+}
+candidate_batches <- candidate_detection
+auto_batches <- candidate_batches
+if (length(manual_batch_columns) > 0) {
+  candidate_batches <- unique(c(manual_batch_columns, candidate_batches))
+  log_message("Including manual batch columns: %s", paste(manual_batch_columns, collapse = ", "))
+}
+if (length(auto_batches) > 0) {
+  auto_filtered <- remove_group_duplicates(auto_batches, config, log_prefix = "Batch candidate")
+  dropped_auto <- setdiff(auto_batches, auto_filtered)
+  if (length(dropped_auto) > 0) {
+    log_message("Removed auto-detected batch columns duplicating dear_group: %s", paste(dropped_auto, collapse = ", "))
+  }
+  auto_batches <- auto_filtered
+}
+if (length(candidate_batches) > 0) {
+  candidate_filtered <- remove_group_duplicates(candidate_batches, config, log_prefix = "Batch candidate")
+  candidate_dropped <- setdiff(candidate_batches, candidate_filtered)
+  if (length(candidate_dropped) > 0) {
+    log_message("Removed batch columns duplicating dear_group from final candidate list: %s", paste(candidate_dropped, collapse = ", "))
+  }
+  candidate_batches <- candidate_filtered
+}
+
+cell_fraction_columns <- character()
+cell_composition_summary <- list(status = "skipped", reason = "cell composition disabled")
+if ((any(grepl("blood", tolower(config$sample_name %||% ""), fixed = TRUE), na.rm = TRUE)) || detect_blood_signal(config)) {
+  cell_comp_result <- estimate_cell_composition(RGset, config, platform_label, cell_comp_reference)
+  if (!is.null(cell_comp_result$fractions) && nrow(cell_comp_result$fractions) == nrow(config)) {
+    frac_df <- as.data.frame(cell_comp_result$fractions)
+    shared_cols <- intersect(names(frac_df), names(config))
+    if (length(shared_cols) > 0) {
+      log_message("Overwriting existing columns with cell composition estimates: %s", paste(shared_cols, collapse = ", "))
+    }
+    for (col in names(frac_df)) {
+      config[[col]] <- frac_df[[col]]
+    }
+    cell_fraction_columns <- names(frac_df)
+  }
+  cell_composition_summary <- cell_comp_result$summary
+}
+
+covars <- split_covariates(config, candidate_batches, protected_columns)
+if (length(cell_fraction_columns) > 0) {
+  covars$numeric <- unique(c(covars$numeric, cell_fraction_columns))
+  covars$cell_composition <- cell_fraction_columns
+}
+dropped_covariates <- attr(covars, "dropped_covariates")
+if (length(dropped_covariates) > 0) {
+  log_message(
+    "Excluded covariates lacking usable variation: %s",
+    paste(sprintf("%s (%s)", names(dropped_covariates), unlist(dropped_covariates)), collapse = ", ")
+  )
+} else {
+  dropped_covariates <- list()
+}
+
+manual_numeric <- match_columns(names(config), directives$numeric)
+if (length(directives$numeric) > 0 && length(manual_numeric) < length(directives$numeric)) {
+  missing_numeric <- setdiff(directives$numeric, manual_numeric)
+  if (length(missing_numeric) > 0) {
+    log_message("Requested numeric covariates not found in configure.tsv: %s", paste(missing_numeric, collapse = ", "))
+  }
+}
+if (length(manual_numeric) > 0) {
+  numeric_batch_conflicts <- intersect(manual_numeric, candidate_batches)
+  if (length(numeric_batch_conflicts) > 0) {
+    log_message(
+      "Skipping numeric covariates that are designated batch columns: %s",
+      paste(numeric_batch_conflicts, collapse = ", ")
+    )
+    manual_numeric <- setdiff(manual_numeric, numeric_batch_conflicts)
+  }
+}
+if (length(manual_numeric) > 0) {
+  covars$numeric <- unique(c(covars$numeric, manual_numeric))
+  log_message("Force-included numeric covariates: %s", paste(manual_numeric, collapse = ", "))
+}
+manual_factor <- match_columns(names(config), directives$factor)
+if (length(directives$factor) > 0 && length(manual_factor) < length(directives$factor)) {
+  missing_factor <- setdiff(directives$factor, manual_factor)
+  if (length(missing_factor) > 0) {
+    log_message("Requested factor covariates not found in configure.tsv: %s", paste(missing_factor, collapse = ", "))
+  }
+}
+if (length(manual_factor) > 0) {
+  factor_batch_conflicts <- intersect(manual_factor, candidate_batches)
+  if (length(factor_batch_conflicts) > 0) {
+    log_message(
+      "Skipping factor covariates that are designated batch columns: %s",
+      paste(factor_batch_conflicts, collapse = ", ")
+    )
+    manual_factor <- setdiff(manual_factor, factor_batch_conflicts)
+  }
+}
+if (length(manual_factor) > 0) {
+  covars$factor <- unique(c(covars$factor, manual_factor))
+  log_message("Force-included factor covariates: %s", paste(manual_factor, collapse = ", "))
+}
+attr(covars, "dropped_covariates") <- NULL
+batch_tracking <- list(
+  auto = auto_batches,
+  manual = manual_batch_columns,
+  protected = protected_columns,
+  diagnostics = batch_diagnostics
+)
+manual_covariates <- list(numeric = manual_numeric, factor = manual_factor)
 
 # ---- Batch effect assessment ------------------------------------------------
 
@@ -3167,6 +3804,7 @@ assess_pca <- function(M_matrix, metadata, variables, prefix) {
     var_type <- if (is.numeric(value)) "numeric" else "factor"
     pvals <- c()
     r2 <- c()
+    used_pcs <- c()
     for (pc in pc_names) {
       df <- data.frame(pc = scores[[pc]], variable = value)
       if (var_type == "numeric") {
@@ -3174,14 +3812,24 @@ assess_pca <- function(M_matrix, metadata, variables, prefix) {
       } else {
         fit <- lm(pc ~ factor(variable), data = df)
       }
-      an <- anova(fit)
-      p <- an$`Pr(>F)`[1]
-      pvals <- c(pvals, p)
+      an <- tryCatch(anova(fit), error = function(e) NULL)
+      if (is.null(an)) {
+        next
+      }
+      p_value <- an$`Pr(>F)`[1]
+      if (is.na(p_value)) {
+        next
+      }
+      pvals <- c(pvals, p_value)
       r2 <- c(r2, summary(fit)$r.squared)
+      used_pcs <- c(used_pcs, pc)
+    }
+    if (length(pvals) == 0) {
+      next
     }
     assessments[[var]] <- data.table(
       variable = var,
-      pc = pc_names[seq_len(length(pvals))],
+      pc = used_pcs,
       p_value = p.adjust(pvals, method = "BH"),
       r_squared = r2,
       type = var_type,
@@ -3299,6 +3947,26 @@ best_metrics <- best_model$metrics
 best_outputs <- best_model$outputs
 model_evaluations <- design_optimisation$evaluated
 
+combat_summary <- list(
+  attempted = 0L,
+  succeeded = 0L,
+  failed = 0L,
+  failure_messages = list()
+)
+if (!is.null(model_evaluations) && nrow(model_evaluations) > 0) {
+  combat_attempts <- model_evaluations[use_combat == TRUE]
+  if (nrow(combat_attempts) > 0) {
+    combat_summary$attempted <- as.integer(nrow(combat_attempts))
+    combat_summary$succeeded <- as.integer(nrow(combat_attempts[status == "ok"]))
+    combat_summary$failed <- as.integer(nrow(combat_attempts[status != "ok"]))
+    fail_msgs <- unique(combat_attempts[status != "ok"]$message %||% character())
+    combat_summary$failure_messages <- if (length(fail_msgs) > 0) as.list(fail_msgs) else list()
+    if (combat_summary$attempted > 0 && combat_summary$succeeded == 0) {
+      log_message("Warning: all %s ComBat model configurations failed; proceeding without ComBat.", combat_summary$attempted)
+    }
+  }
+}
+
 selected_covariates <- best_outputs$covariates_final
 covars$numeric <- selected_covariates$numeric
 covars$factor <- selected_covariates$factor
@@ -3357,6 +4025,10 @@ log_message(
 )
 
 log_message("Running limma differential methylation with selected design...")
+
+minfi_correction_applied <- isTRUE(best_metrics$batch_in_design) || isTRUE(best_params$use_combat) || isTRUE(best_params$use_sva)
+sesame_correction_applied <- sesame_available && !identical(selected_sesame_method, "not_available") &&
+  (isTRUE(best_metrics$batch_in_design) || isTRUE(best_params$use_combat) || isTRUE(best_params$use_sva))
 
 design_selection_summary <- list(
   strategy = if (used_fallback_design || (!is.null(design_optimisation$note) && identical(design_optimisation$note, "fallback"))) "fallback" else "optimisation",
@@ -3712,14 +4384,24 @@ plot_pca <- function(pca_scores, metadata, color_var, title) {
   ggplot(df, aes(x = PC1, y = PC2, color = .data[[color_var]])) +
     geom_point(size = 3) +
     theme_minimal() +
-    labs(title = title, color = color_var)
+      labs(title = title, color = color_var)
 }
 
 pca_plots <- list(
   plot_pca(pca_minfi_pre$scores, metadata_dt, "dear_group", "PCA minfi (pre)"),
-  plot_pca(pca_minfi_post$scores, metadata_dt, "dear_group", "PCA minfi (post)"),
+  plot_pca(
+    pca_minfi_post$scores,
+    metadata_dt,
+    "dear_group",
+    if (minfi_correction_applied) "PCA minfi (post)" else "PCA minfi (post · no correction)"
+  ),
   plot_pca(pca_sesame_pre$scores, metadata_dt, "dear_group", "PCA sesame (pre)"),
-  plot_pca(pca_sesame_post$scores, metadata_dt, "dear_group", "PCA sesame (post)")
+  plot_pca(
+    pca_sesame_post$scores,
+    metadata_dt,
+    "dear_group",
+    if (sesame_correction_applied) "PCA sesame (post)" else "PCA sesame (post · no correction)"
+  )
 )
 write_plot(pca_plots[[1]], file.path(fig_dir, "pca_minfi_pre"))
 write_plot(pca_plots[[2]], file.path(fig_dir, "pca_minfi_post"))
@@ -4196,6 +4878,10 @@ path <- create_interactive(
 )
 if (!is.null(path)) interactive_files$pca_pre <- path
 meta <- interactive_output_metadata("pca_post")
+if (!minfi_correction_applied) {
+  meta$title <- paste0(meta$title, " · no correction")
+  meta$subtitle <- "No batch/SVA adjustment was applied; plot matches the pre-correction PCA."
+}
 path <- create_interactive(
   ggplotly(pca_plots[[2]]),
   file.path(interactive_dir, "pca_post"),
@@ -4447,6 +5133,21 @@ covariate_stats_export <- list(
   }
 )
 
+batch_diagnostics_export <- lapply(batch_tracking$diagnostics, function(values) {
+  if (is.null(values)) {
+    list()
+  } else if (is.list(values) && !is.atomic(values)) {
+    if (length(values) == 0) list() else values
+  } else {
+    vals <- unique(as.character(values))
+    if (length(vals) == 0 || (length(vals) == 1 && identical(vals, ""))) {
+      list()
+    } else {
+      as.list(vals)
+    }
+  }
+})
+
 design_selection_export <- list(
   strategy = design_selection_summary$strategy,
   status = design_selection_summary$status,
@@ -4458,6 +5159,13 @@ design_selection_export <- list(
   covariate_stats = covariate_stats_export,
   batch_options = design_selection_summary$batch_options
 )
+
+design_covariates <- list(
+  numeric = best_metrics$numeric_covars %||% character(),
+  factor = best_metrics$factor_covars %||% character()
+)
+
+available_covariates <- covars
 
 summary <- list(
   gse = opt$gse,
@@ -4473,14 +5181,30 @@ summary <- list(
     auto = batch_tracking$auto,
     manual = batch_tracking$manual,
     final = candidate_batches,
-    selected = batch_to_use
+    selected = batch_to_use,
+    diagnostics = batch_diagnostics_export
   ),
   protected_batch_columns = batch_tracking$protected,
-  covariates = covars,
+  sample_qc = sample_qc_summary,
+  probe_filters = probe_filter_summary,
+  cell_composition = cell_composition_summary,
+  covariates = design_covariates,
+  available_covariates = available_covariates,
   manual_covariates = manual_covariates,
   dropped_covariates = dropped_covariates_summary,
   batch_methods = list(minfi = selected_minfi_method, sesame = selected_sesame_method),
+  corrections = list(
+    minfi = if (minfi_correction_applied) "applied" else "none",
+    sesame = if (!sesame_available || identical(selected_sesame_method, "not_available")) {
+      "not_available"
+    } else if (sesame_correction_applied) {
+      "applied"
+    } else {
+      "none"
+    }
+  ),
   combat_applied = isTRUE(best_params$use_combat),
+  combat_models = combat_summary,
   batch_column = batch_to_use,
   sva_surrogates = surrogate_count,
   design_selection = design_selection_export,

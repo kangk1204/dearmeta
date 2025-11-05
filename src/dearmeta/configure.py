@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -40,6 +41,7 @@ CANDIDATE_BATCH_KEYS = {
 MIN_BATCH_NONMISSING_RATIO = 0.5
 MIN_BATCH_LEVEL_SIZE = 2
 PROTECTED_BATCH_KEYWORDS = ("sex", "gender")
+SENTRIX_PATTERN = re.compile(r"_(\d{8,12})_(R\d{2}C\d{2})", re.IGNORECASE)
 
 
 def _normalize_name(name: str) -> str:
@@ -84,6 +86,11 @@ def assemble_metadata_frame(
             "idat_red": _relativise_path(pair.red, workspace_root),
             "idat_grn": _relativise_path(pair.green, workspace_root),
         }
+        sentrix_id, sentrix_pos = _extract_sentrix_fields(pair.red or pair.green)
+        if sentrix_id:
+            row["sentrix_id"] = sentrix_id
+        if sentrix_pos:
+            row["sentrix_position"] = sentrix_pos
         for key, value in sample.characteristics.items():
             if value:
                 row[key] = value
@@ -179,6 +186,15 @@ def _relativise_path(location: str, workspace_root: Path) -> str:
         return str(path.relative_to(workspace_root.resolve()))
     except ValueError:
         return str(path)
+
+
+def _extract_sentrix_fields(path: str) -> tuple[Optional[str], Optional[str]]:
+    name = Path(path).name
+    match = SENTRIX_PATTERN.search(name)
+    if not match:
+        return None, None
+    sentrix_id, position = match.groups()
+    return sentrix_id, position.upper()
 
 
 def generate_configure_tsv(

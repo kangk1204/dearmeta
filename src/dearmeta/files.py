@@ -59,8 +59,10 @@ def download_file(
     backoff_factor: float = 1.5,
     timeout: int = 60,
     show_progress: bool = True,
+    expected_md5: Optional[str] = None,
+    expected_size: Optional[int] = None,
 ) -> str:
-    """Download a file from ``url`` to ``destination``; return MD5 checksum."""
+    """Download a file from ``url`` to ``destination`` and verify integrity; return MD5."""
     ensure_dir(destination.parent)
     attempt = 0
     while True:
@@ -68,6 +70,18 @@ def download_file(
             response = requests.get(url, stream=True, timeout=timeout)
             response.raise_for_status()
             checksum = _stream_to_file(response, destination, show_progress=show_progress)
+            if expected_size is not None:
+                actual_size = destination.stat().st_size
+                if actual_size != expected_size:
+                    destination.unlink(missing_ok=True)
+                    raise DownloadError(
+                        f"Size mismatch for {destination.name}: expected {expected_size}, got {actual_size}"
+                    )
+            if expected_md5 is not None and checksum.lower() != expected_md5.lower():
+                destination.unlink(missing_ok=True)
+                raise DownloadError(
+                    f"Checksum mismatch for {destination.name}: expected {expected_md5}, got {checksum}"
+                )
             return checksum
         except requests.RequestException as exc:  # pragma: no cover - error path
             attempt += 1
@@ -122,4 +136,3 @@ def relative_symlink(source: Path, link_name: Path) -> None:
     if link_name.exists() or link_name.is_symlink():
         link_name.unlink()
     link_name.symlink_to(source.resolve())
-

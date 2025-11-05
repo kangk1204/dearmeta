@@ -42,28 +42,17 @@ These are commonly needed when compiling R or Python dependencies.
    cd dearmeta
    ```
 
-2. **Create and activate a virtual environment**
+2. **Run the bootstrap script (installs Python + R deps)**
+   ```bash
+   bash scripts/bootstrap.sh
+   ```
+   This wraps the three manual steps (pip install, `renv::restore`, `scripts/install.R`). You only need to re-run it when dependencies change.
+
+3. *(Optional)* **Create/activate your own virtual environment**
    ```bash
    python -m venv .venv
-   # Linux / macOS
    source .venv/bin/activate
-   # Windows PowerShell
-   # .\.venv\Scripts\Activate.ps1
    ```
-
-3. **Install Python dependencies**
-   ```bash
-   pip install -U pip
-   pip install -e .
-   # or include developer tools:
-   # pip install -e .[dev]
-   ```
-
-4. **Install R packages used by the analysis pipeline**
-   ```bash
-   Rscript scripts/install.R
-   ```
-   This script installs the required CRAN and Bioconductor packages. Run it once per machine (rerun whenever R is reinstalled).
 
 ## Quick Start
 
@@ -79,6 +68,23 @@ These are commonly needed when compiling R or Python dependencies.
    dearmeta analysis --gse GSE123456
    ```
    > Need a specific baseline? Append `--group-ref normoweight` (alias `--group_ref`) so limma treats that group as the reference when building contrasts. Otherwise the first `dear_group` in your configure file becomes the default reference.
+5. Reproduce this exact software stack:
+   ```bash
+   python -m pip install -r requirements.lock
+   Rscript -e 'renv::restore(prompt = FALSE)'
+   ```
+   The `requirements.lock` and `renv.lock` files pin every Python and R dependency (including Bioconductor releases) so collaborators can recreate the DearMeta environment bit-for-bit.
+
+### QC controls
+- `--poobah-threshold 0.05` adjusts the sesame pOOBAH failure cutoff (between 0 and 1).
+- `--drop-sesame-failed` removes samples whose sesame failure rate exceeds the threshold before continuing.
+- Batch/sample processing currently runs serially for stability; there is no parallel worker flag to configure.
+- See `docs/statistical_assumptions.md` for citations supporting every QC/batch threshold shipped with DearMeta.
+
+### Cell composition (blood datasets)
+- DearMeta can now estimate leukocyte fractions via the Houseman/IDOL method (`minfi::estimateCellCounts2`).
+- Enabled by default (`--cell-comp-reference auto`): it auto-detects blood-like metadata and appends `cell_*` columns to `configure.tsv`, which are then available as numeric covariates.
+- Force or disable behaviour with `--cell-comp-reference blood` or `--cell-comp-reference none` if auto-detection isn’t appropriate.
 
 DearMeta will create a workspace per series:
 

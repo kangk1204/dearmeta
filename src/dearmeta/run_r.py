@@ -71,7 +71,9 @@ def run_r_analysis(
         bufsize=1,
     )
     captured_lines = []
-    assert process.stdout is not None
+    if process.stdout is None:
+        process.terminate()
+        raise RuntimeError("Failed to capture Rscript stdout; subprocess pipe was not created.")
     try:
         for raw_line in process.stdout:
             line = raw_line.rstrip("\n")
