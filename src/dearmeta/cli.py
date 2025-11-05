@@ -165,13 +165,20 @@ def load_configure_dataframe(path: Path) -> pd.DataFrame:
     with path.open("r", encoding="utf-8-sig") as handle:
         for idx, line in enumerate(handle):
             stripped = line.strip()
-            clean = stripped.lstrip("\"").strip()
-            if not clean or clean.startswith("#"):
+            if not stripped:
                 continue
-            first_field = clean.split("\t", 1)[0].strip().strip('"\'').lower()
+            normalized = stripped.lstrip("\ufeff")
+            clean = normalized.lstrip("\"").strip()
+            first_field = clean.split("\t", 1)[0].strip().strip("\"'").lower()
             if first_field == "dear_group":
                 header_row = idx
                 break
+            if not normalized.startswith("#"):
+                preview = stripped[:40]
+                raise typer.BadParameter(
+                    "configure.tsv must contain only comment lines (starting with '#') "
+                    f"before the dear_group header; offending line {idx + 1}: {preview}"
+                )
     if header_row is None:
         raise typer.BadParameter("Unable to locate 'dear_group' header in configure.tsv")
     df = pd.read_csv(path, sep="\t", comment="#", header=header_row, encoding="utf-8-sig")
