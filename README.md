@@ -29,10 +29,16 @@ These are commonly needed when compiling R or Python dependencies.
 - Install [Homebrew](https://brew.sh/) if it is not already available, then run:
   ```bash
   brew install python@3.11 libxml2 curl openssl
-  python3 -m venv .venv
   ```
-- Install R 4.0+ using the official Apple Silicon installer from CRAN (the `.pkg` under “macOS arm64”).
-- If R packages complain about headers, export `PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:$PKG_CONFIG_PATH"` before re-running `Rscript scripts/install.R`.
+  If you prefer the Homebrew Python, prepend `/opt/homebrew/opt/python@3.11/bin` to your `PATH`.
+- Create and activate a dedicated virtual environment *before* running any DearMeta scripts so `python3` resolves to that interpreter:
+  ```bash
+  python3 -m venv .dearmeta
+  source .dearmeta/bin/activate
+  ```
+  The bootstrap script installs DearMeta in editable mode, so the `dearmeta` command becomes available inside this environment automatically.
+- Install R 4.4.x (arm64) from CRAN. That release pairs with Bioconductor 3.20, which the installer script now auto-detects and uses to pull the right package versions.
+- If R packages complain about headers, export `PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:$PKG_CONFIG_PATH"` before re-running `bash scripts/bootstrap.sh` (which calls `Rscript scripts/install.R` under the hood).
 
 ## Installation (Step by Step)
 
