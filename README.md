@@ -1,6 +1,6 @@
-# DearMeta
+# DEARMETA
 
-DearMeta is a command-line toolkit that downloads, preprocesses, and analyses Illumina EPIC GEO methylation datasets. A single `dearmeta` command orchestrates metadata collection, IDAT retrieval, processing through an R pipeline, and report generation.
+DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Illumina EPIC GEO methylation datasets. A single `dearmeta` command orchestrates metadata collection, IDAT retrieval, processing through an R pipeline, and report generation.
 
 ## Why DearMeta?
 - Automatically fetch GEO series metadata and platform annotations.
