@@ -6,7 +6,7 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
 - Automatically fetch GEO series metadata and platform annotations.
 - Download paired IDAT files with caching to avoid duplicate transfers.
 - Create a consistent workspace layout for every dataset.
-- Run an opinionated R analysis pipeline (`scripts/analysis.R`) to produce QC plots, differential methylation tables, and HTML reports.
+- Run an opinionated R analysis pipeline (`src/dearmeta/data/analysis.R`) to produce QC plots, differential methylation tables, and HTML reports.
 - Preserve run configurations (`configure.tsv` in each workspace root) and logs for reproducibility.
 
 ## Prerequisites
