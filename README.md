@@ -14,66 +14,111 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
 | Requirement | Details |
 |-------------|---------|
 | Python      | 3.10 or newer |
-| R           | 4.5 or newer (renv.lock pins Bioconductor 3.22 which requires R ≥ 4.5) |
-| Git         | For cloning and keeping the project up to date |
-| Internet    | Required for GEO API calls and supplementary file downloads |
+| R           | 4.5 or newer (matches Bioconductor 3.22 in `renv.lock`) |
+| Git         | For cloning/updates |
+| Internet    | Needed for GEO downloads |
 
-**Recommended system packages (Linux/WSL):**
+---
+
+## Ubuntu / Windows (WSL) Installation
+
+### 1. System packages
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-dev \\
+sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-dev \
   libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
 ```
-These headers/libs are required when compiling CRAN and Bioconductor packages such as `xml2`, `png`, `rhdf5`, and `Rsamtools`.
+These headers are required for CRAN/Bioconductor packages (`xml2`, `png`, `rhdf5`, `Rsamtools`, …). Run the same commands inside Ubuntu WSL if you are on Windows.
 
-**Apple Silicon (macOS M1–M4) tips:**
-- Install [Homebrew](https://brew.sh/) if it is not already available, then run:
+### 2. Clone the repository
+```bash
+git clone https://github.com/kangk1204/dearmeta.git
+cd dearmeta
+```
+
+### 3. Create a Python environment (pick one)
+- **Conda**
   ```bash
-  brew install python@3.11 libxml2 curl openssl
+  conda create -n dearmeta python=3.11 r-base=4.5.1 -c conda-forge
+  conda activate dearmeta
+  conda install -y -c conda-forge zlib libpng xz
+  python -m pip install --upgrade pip
+  pip install -r requirements.lock
   ```
-  If you prefer the Homebrew Python, prepend `/opt/homebrew/opt/python@3.11/bin` to your `PATH` and create a virtual environment (`python3 -m venv .dearmeta && source .dearmeta/bin/activate`) before running any DearMeta scripts.
-- Install R 4.5+ using the official Apple Silicon installer from CRAN (the `.pkg` under “macOS arm64”). If you are temporarily pinned to R 4.4/Bioconductor 3.20, the bootstrap script auto-detects that release and installs the matching package matrix, but 4.5+ remains the recommended baseline.
-- If R packages complain about headers, export `PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:$PKG_CONFIG_PATH"` before re-running `Rscript scripts/install.R` or `bash scripts/bootstrap.sh`.
+- **Virtualenv**
+  ```bash
+  python -m venv .dearmeta
+  source .dearmeta/bin/activate
+  python -m pip install --upgrade pip
+  pip install -r requirements.lock
+  ```
+  > With a plain virtualenv you must have R ≥4.5 installed separately (CRAN Ubuntu repo on Linux, CRAN installer on macOS) and ensure `Rscript` points to that build.
 
-## Installation (Step by Step)
+### 4. Prime Bioconductor (optional but speeds up installs)
+```bash
+Rscript scripts/prime-bioconductor.R
+```
+This script installs `BiocManager`, pins Bioconductor 3.22, and preloads the heavy genomics stack so Bootstrap finishes faster. Inspect the script if you want to reproduce the commands manually.
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/kangk1204/dearmeta.git
-   cd dearmeta
-   ```
+### 5. Run the bootstrap script
+```bash
+bash scripts/bootstrap.sh
+```
+It performs `pip install -r requirements.lock`, `renv::restore()`, and `Rscript scripts/install.R` in one go. The script verifies that your `Rscript` is new enough; override it via `RSCRIPT=/path/to/Rscript` if you maintain multiple R builds.
 
-2. **Create and activate a runtime environment (pick one)**
+### 6. Verify
+```bash
+dearmeta --help
+Rscript -e "sessionInfo()"
+```
+You should see the `renv` library path in the R output.
 
-   **Conda (recommended, keeps Python + R together):**
-   ```bash
-   conda create -n dearmeta python=3.11 r-base=4.5.1 -c conda-forge
-   conda activate dearmeta
-   conda install -y -c conda-forge zlib libpng xz
-   python -m pip install --upgrade pip
-   pip install -r requirements.lock
-   ```
+---
 
-   **System Python virtualenv:**
-   ```bash
-   python -m venv .dearmeta
-   source .dearmeta/bin/activate
-   python -m pip install --upgrade pip
-   pip install -r requirements.lock
-   ```
-   > When using a standalone virtualenv you must also install R ≥4.5 yourself (e.g., via the CRAN Ubuntu repo or the macOS installer) and ensure `Rscript` points at that build.
+## macOS (Apple Silicon M1–M4) Installation
 
-3. *(Optional but recommended)* **Prime Bioconductor 3.22 inside the active environment**
-   ```bash
-   Rscript scripts/prime-bioconductor.R
-   ```
-   The script installs `BiocManager` + supporting CRAN helpers, pins Bioconductor 3.22, pulls in the "core" group (S4Vectors, IRanges, DelayedArray, SummarizedExperiment, etc.), and then caches the genomics stack (`XVector`, `Biostrings`, `Rsamtools`, `GEOquery`, …) that DearMeta needs before running the main bootstrap. If you prefer to run the commands manually, inspect the script contents for the exact `BiocManager::install()` calls.
+### 1. Homebrew prerequisites
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+brew install python@3.11 libxml2 curl openssl
+```
+Add Homebrew Python to PATH if desired:
+```bash
+echo 'export PATH="/opt/homebrew/opt/python@3.11/bin:$PATH"' >> ~/.zprofile
+source ~/.zprofile
+```
 
-4. **Run the bootstrap script (installs pinned Python + R deps)**
-   ```bash
-   bash scripts/bootstrap.sh
-   ```
-   This wraps the three manual steps (pip install, `renv::restore`, `scripts/install.R`). You only need to re-run it when dependencies change. The script reads `renv.lock` and refuses to continue if the `Rscript` on your PATH is older than the pinned R version; set `RSCRIPT=/path/to/Rscript-4.5` when you manage multiple builds.
+### 2. Install R 4.5+
+Download the Apple Silicon `.pkg` from CRAN and install it. R 4.5 is recommended; the bootstrap script can fall back to 4.4/Bioc 3.20 only if unavoidable.
+
+### 3. Create a virtual environment
+```bash
+python3 -m venv .dearmeta
+source .dearmeta/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.lock
+```
+
+### 4. Export pkg-config hints
+```bash
+export PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:$PKG_CONFIG_PATH"
+```
+Add this line to `~/.zprofile` if you rebuild frequently.
+
+### 5. Clone + bootstrap
+```bash
+git clone https://github.com/kangk1204/dearmeta.git
+cd dearmeta
+bash scripts/bootstrap.sh
+```
+
+### 6. Verify
+Same commands as Ubuntu:
+```bash
+dearmeta --help
+Rscript -e "sessionInfo()"
+```
+Again, confirm the `renv` library path in the R output.
 
 ## Quick Start
 
