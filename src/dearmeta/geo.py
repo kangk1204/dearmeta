@@ -27,6 +27,7 @@ PLATFORM_ID_ALIASES = {
     "GPL13534": "HM450",  # Illumina HumanMethylation450 BeadChip
     "GPL21145": "EPICv1",  # Illumina HumanMethylationEPIC BeadChip
     "GPL33022": "EPICv2",  # Illumina MethylationEPIC v2.0 BeadChip (new GEO accession)
+    "GPL23976": "EPICv2",  # Illumina Infinium HumanMethylation850 BeadChip (GEO alias)
 }
 
 
