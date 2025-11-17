@@ -10,6 +10,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Optional
 
+import io
+
 import pandas as pd
 import typer
 from rich.console import Console
@@ -156,32 +158,46 @@ def generate_markdown_summary(summary_path: Path) -> Path:
     return output_path
 
 
+def _strip_matching_quotes(text: str) -> str:
+    return text.strip("\"'")
+
+
 def load_configure_dataframe(path: Path) -> pd.DataFrame:
     """Load configure.tsv, tolerating comment-prefixed header rows."""
-    df = pd.read_csv(path, sep="\t", comment="#", encoding="utf-8-sig")
-    if "dear_group" in df.columns:
-        return df
-    header_row = None
+    normalized_lines: list[str] = []
+    header_row_found = False
     with path.open("r", encoding="utf-8-sig") as handle:
         for idx, line in enumerate(handle):
-            stripped = line.strip()
-            if not stripped:
+            normalized = line.lstrip("\ufeff")
+            stripped = normalized.rstrip("\n")
+            clean = stripped.strip()
+            if not clean:
+                normalized_lines.append("")
                 continue
-            normalized = stripped.lstrip("\ufeff")
-            clean = normalized.lstrip("\"").strip()
-            first_field = clean.split("\t", 1)[0].strip().strip("\"'").lower()
-            if first_field == "dear_group":
-                header_row = idx
-                break
-            if not normalized.startswith("#"):
-                preview = stripped[:40]
+            working = clean
+            while working and working[0] in ("\"", "'", " "):
+                working = working[1:]
+            if working.startswith("#"):
+                normalized_lines.append("#" + working[1:])
+                continue
+            first_field = working.split("\t", 1)[0].strip()
+            first_field = _strip_matching_quotes(first_field).strip().lower()
+            if first_field == "dear_group" and not header_row_found:
+                header_row_found = True
+                normalized_lines.append(clean)
+                continue
+            if not header_row_found:
+                preview = clean[:40]
                 raise typer.BadParameter(
                     "configure.tsv must contain only comment lines (starting with '#') "
                     f"before the dear_group header; offending line {idx + 1}: {preview}"
                 )
-    if header_row is None:
+            normalized_lines.append(clean)
+    if not header_row_found:
         raise typer.BadParameter("Unable to locate 'dear_group' header in configure.tsv")
-    df = pd.read_csv(path, sep="\t", comment="#", header=header_row, encoding="utf-8-sig")
+    normalized_text = "\n".join(normalized_lines)
+    buffer = io.StringIO(normalized_text)
+    df = pd.read_csv(buffer, sep="\t", comment="#", encoding="utf-8-sig")
     if "dear_group" not in df.columns:
         raise typer.BadParameter("configure.tsv missing 'dear_group' column")
     return df

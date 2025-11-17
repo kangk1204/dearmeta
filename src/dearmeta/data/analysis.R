@@ -13,6 +13,7 @@ suppressPackageStartupMessages({
   library(sva)
   library(DMRcate)
   library(ggplot2)
+  library(ggrepel)
   library(plotly)
   library(htmlwidgets)
   library(htmltools)
@@ -92,6 +93,7 @@ for (dir_path in paths) {
 }
 
 options(dearmeta.runtime_dir = paths$runtime)
+options(dearmeta.combat_blacklist = character())
 
 log_message <- function(...) {
   args <- list(...)
@@ -133,6 +135,7 @@ group_reference <- NA_character_
 
 DEFAULT_PROTECTED_BATCH <- c("sex", "gender", "sex_at_birth", "biological_sex")
 PROTECTED_BATCH_PATTERNS <- c("sex", "gender")
+BIOLOGICAL_BATCH_PATTERNS <- c("tissue", "tumour", "tumor", "disease", "diagnosis", "cell", "cellline", "treatment", "dose", "timepoint", "stage", "phenotype")
 BATCH_TARGET_MEDIAN_P <- 0.8  # [Leek2012]
 MIN_BATCH_NONMISSING_RATIO <- 0.5  # [Johnson2007]
 MIN_BATCH_LEVEL_SIZE <- 2L  # limma user guide §9
@@ -148,6 +151,14 @@ normalize_name <- function(x) {
 }
 
 matches_protected_pattern <- function(name, patterns = PROTECTED_BATCH_PATTERNS) {
+  norm <- normalize_name(name)
+  any(vapply(patterns, function(pattern) grepl(pattern, norm, fixed = TRUE), logical(1)))
+}
+
+matches_biological_pattern <- function(name, patterns = BIOLOGICAL_BATCH_PATTERNS) {
+  if (length(patterns) == 0) {
+    return(FALSE)
+  }
   norm <- normalize_name(name)
   any(vapply(patterns, function(pattern) grepl(pattern, norm, fixed = TRUE), logical(1)))
 }
@@ -357,6 +368,35 @@ ensure_sesame_support_resources <- function(resources = SESAME_SUPPORT_RESOURCES
   invisible(cached_any)
 }
 
+ensure_namespace_available <- function(pkg, bioc = TRUE, auto_install_env = "DEARMETA_AUTO_INSTALL_PACKAGES") {
+  if (requireNamespace(pkg, quietly = TRUE)) {
+    return(TRUE)
+  }
+  auto_install <- tolower(Sys.getenv(auto_install_env, "true")) %in% c("1", "true", "yes", "on")
+  if (!auto_install) {
+    return(FALSE)
+  }
+  installer <- NULL
+  if (bioc) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+      install.packages("BiocManager")
+    }
+    installer <- function(target) BiocManager::install(target, update = FALSE, ask = FALSE)
+  } else {
+    installer <- function(target) install.packages(target)
+  }
+  tryCatch(
+    {
+      installer(pkg)
+      requireNamespace(pkg, quietly = TRUE)
+    },
+    error = function(e) {
+      log_message("Auto-installation failed for %s: %s", pkg, conditionMessage(e))
+      FALSE
+    }
+  )
+}
+
 sanitize_covariate <- function(x) {
   if (is.character(x)) {
     x <- trimws(x)
@@ -495,13 +535,18 @@ detect_candidate_batches <- function(cfg, protect_cols = character()) {
   diagnostics <- list(
     excluded_support = character(),
     excluded_confounded = character(),
-    excluded_confounded_detail = list()
+    excluded_confounded_detail = list(),
+    excluded_biological = character()
   )
   keywords <- c("slide", "barcode", "sentrix", "array", "plate", "batch", "center", "processing", "chip", "position")
   protected_lower <- tolower(protect_cols)
   total_rows <- nrow(cfg)
   for (col in setdiff(names(cfg), ignore_cols)) {
     if (tolower(col) %in% protected_lower || matches_protected_pattern(col)) {
+      next
+    }
+    if (matches_biological_pattern(col)) {
+      diagnostics$excluded_biological <- unique(c(diagnostics$excluded_biological, col))
       next
     }
     values <- sanitize_covariate(cfg[[col]])
@@ -531,7 +576,7 @@ detect_candidate_batches <- function(cfg, protect_cols = character()) {
   result
 }
 
-split_covariates <- function(cfg, batch_cols, protected_cols = character()) {
+split_covariates <- function(cfg, batch_cols, protected_cols = character(), forbidden_covars = character()) {
   ignore_cols <- c("dear_group", "gsm_id", "sample_name", "idat_red", "idat_grn", "platform_version", "species")
   numeric_cols <- character(0)
   factor_cols <- character(0)
@@ -539,8 +584,13 @@ split_covariates <- function(cfg, batch_cols, protected_cols = character()) {
   group_values <- sanitize_covariate(cfg$dear_group)
   group_levels <- unique(na.omit(group_values))
   protected_lower <- tolower(protected_cols)
+  forbidden_lower <- tolower(forbidden_covars)
   for (col in setdiff(names(cfg), ignore_cols)) {
     if (col %in% batch_cols) {
+      next
+    }
+    if (tolower(col) %in% forbidden_lower) {
+      dropped[[col]] <- "blocked due to batch/biological confounding"
       next
     }
     col_lower <- tolower(col)
@@ -587,6 +637,38 @@ split_covariates <- function(cfg, batch_cols, protected_cols = character()) {
   result <- list(numeric = unique(numeric_cols), factor = unique(factor_cols))
   attr(result, "dropped_covariates") <- dropped
   result
+}
+
+auto_force_covariates <- function(cfg, blacklist = character(), protected_cols = character()) {
+  ignore_cols <- c("dear_group", "gsm_id", "sample_name", "idat_red", "idat_grn", "platform_version", "species")
+  keyword_factors <- c("tissue", "treatment", "disease", "diagnosis", "line", "subtype", "phenotype", "timepoint", "stage")
+  keyword_numeric <- c("age", "gestational", "bmi", "weight", "ph", "cell")
+  forced_numeric <- character()
+  forced_factor <- character()
+  blocked <- tolower(unique(c(blacklist, protected_cols)))
+  for (col in setdiff(names(cfg), ignore_cols)) {
+    norm <- normalize_name(col)
+    if (norm %in% blocked) {
+      next
+    }
+    values <- sanitize_covariate(cfg[[col]])
+    if (duplicates_dear_group(cfg$dear_group, values)) {
+      next
+    }
+    if (any(vapply(keyword_numeric, function(pattern) grepl(pattern, norm, fixed = TRUE), logical(1)))) {
+      numeric_values <- suppressWarnings(as.numeric(values))
+      if (sum(!is.na(numeric_values)) >= 3 && length(unique(na.omit(numeric_values))) >= 2) {
+        forced_numeric <- c(forced_numeric, col)
+      }
+      next
+    }
+    if (any(vapply(keyword_factors, function(pattern) grepl(pattern, norm, fixed = TRUE), logical(1)))) {
+      if (length(unique(na.omit(values))) >= 2) {
+        forced_factor <- c(forced_factor, col)
+      }
+    }
+  }
+  list(numeric = unique(forced_numeric), factor = unique(forced_factor))
 }
 
 safe_factor <- function(x) {
@@ -691,6 +773,22 @@ beta_from_M <- function(M_matrix) {
   beta
 }
 
+determine_sva_cap <- function(sample_count, design_cols, user_cap = NA_integer_) {
+  if (!is.na(user_cap) && user_cap >= 0) {
+    return(as.integer(user_cap))
+  }
+  if (sample_count <= 8) {
+    return(0L)
+  }
+  structural_cap <- sample_count - design_cols - 3
+  if (structural_cap <= 0) {
+    return(0L)
+  }
+  dynamic_cap <- floor(sample_count / 4)
+  default_cap <- min(structural_cap, dynamic_cap, 15L)
+  max(default_cap, 0L)
+}
+
 apply_combat <- function(M_matrix, metadata, batch_col, design) {
   if (is.null(batch_col) || !nzchar(batch_col)) {
     stop("apply_combat requires a batch column")
@@ -711,6 +809,30 @@ apply_combat <- function(M_matrix, metadata, batch_col, design) {
   rownames(combat_res) <- rownames(M_matrix)
   colnames(combat_res) <- colnames(M_matrix)
   combat_res
+}
+
+mark_combat_failure <- function(batch_col, reason = NULL) {
+  if (is.null(batch_col) || !nzchar(batch_col)) {
+    return(invisible(NULL))
+  }
+  failed <- getOption("dearmeta.combat_blacklist", character())
+  if (!batch_col %in% failed) {
+    options(dearmeta.combat_blacklist = c(failed, batch_col))
+    if (!is.null(reason)) {
+      log_message("ComBat disabled for %s after failure: %s", batch_col, reason)
+    } else {
+      log_message("ComBat disabled for %s after failure.", batch_col)
+    }
+  }
+  invisible(NULL)
+}
+
+combat_is_blacklisted <- function(batch_col) {
+  if (is.null(batch_col) || !nzchar(batch_col)) {
+    return(FALSE)
+  }
+  failed <- getOption("dearmeta.combat_blacklist", character())
+  batch_col %in% failed
 }
 
 detect_blood_signal <- function(metadata) {
@@ -744,7 +866,7 @@ infer_cell_reference <- function(metadata, option) {
   "none"
 }
 
-estimate_cell_composition <- function(rgset, metadata, platform_label, option, log_fn = log_message) {
+estimate_cell_composition <- function(rgset, metadata, platform_label, option, target_names = NULL, log_fn = log_message) {
   summary <- list(status = "skipped", reason = "cell composition disabled")
   if (is.null(rgset) || !inherits(rgset, "RGChannelSet")) {
     summary <- list(status = "failed", reason = "RGChannelSet unavailable")
@@ -763,15 +885,28 @@ estimate_cell_composition <- function(rgset, metadata, platform_label, option, l
   }
   reference_platform <- if (platform_label %in% c("EPICv1", "EPICv2")) "IlluminaHumanMethylationEPIC" else "IlluminaHumanMethylation450k"
   ref_pkg <- if (reference_platform == "IlluminaHumanMethylationEPIC") "FlowSorted.Blood.EPIC" else "FlowSorted.Blood.450k"
-  if (!requireNamespace(ref_pkg, quietly = TRUE)) {
+  if (!ensure_namespace_available(ref_pkg, bioc = TRUE)) {
     if (!is.null(log_fn)) {
       log_fn("Cell composition skipped: Bioconductor package %s is not installed.", ref_pkg)
     }
     summary <- list(status = "failed", reason = sprintf("Package %s not installed", ref_pkg))
     return(list(fractions = NULL, summary = summary))
   }
+  suppressPackageStartupMessages(require(ref_pkg, character.only = TRUE))
+  estimate_fun <- NULL
+  method_label <- NULL
+  if ("estimateCellCounts2" %in% getNamespaceExports("minfi")) {
+    estimate_fun <- minfi::estimateCellCounts2
+    method_label <- "estimateCellCounts2"
+  } else if ("estimateCellCounts" %in% getNamespaceExports("minfi")) {
+    estimate_fun <- minfi::estimateCellCounts
+    method_label <- "estimateCellCounts"
+  } else {
+    summary <- list(status = "failed", reason = "Neither estimateCellCounts2 nor estimateCellCounts available in minfi")
+    return(list(fractions = NULL, summary = summary))
+  }
   counts_obj <- tryCatch(
-    minfi::estimateCellCounts2(
+    estimate_fun(
       rgset,
       compositeCellType = "Blood",
       processMethod = "preprocessNoob",
@@ -790,21 +925,31 @@ estimate_cell_composition <- function(rgset, metadata, platform_label, option, l
     summary <- list(status = "failed", reason = conditionMessage(counts_obj))
     return(list(fractions = NULL, summary = summary))
   }
-  counts_matrix <- counts_obj$counts
+  counts_matrix <- NULL
+  if (is.list(counts_obj) && "counts" %in% names(counts_obj)) {
+    counts_matrix <- counts_obj$counts
+  } else if (is.matrix(counts_obj)) {
+    counts_matrix <- counts_obj
+  }
   if (is.null(counts_matrix)) {
-    if (is.matrix(counts_obj)) {
-      counts_matrix <- counts_obj
-    } else {
-      summary <- list(status = "failed", reason = "Unexpected estimateCellCounts2 output")
-      return(list(fractions = NULL, summary = summary))
-    }
+    summary <- list(status = "failed", reason = "Unexpected cell composition output format")
+    return(list(fractions = NULL, summary = summary))
   }
   sample_names <- rownames(counts_matrix)
   if (is.null(sample_names)) {
     summary <- list(status = "failed", reason = "Cell count output missing rownames")
     return(list(fractions = NULL, summary = summary))
   }
-  align_idx <- match(metadata$gsm_id, sample_names)
+  desired_names <- target_names
+  if (is.null(desired_names) || length(desired_names) == 0) {
+    desired_names <- metadata$gsm_id
+  }
+  align_idx <- match(desired_names, sample_names)
+  if (any(is.na(align_idx))) {
+    sample_names_base <- sub("_.*$", "", sample_names)
+    desired_base <- sub("_.*$", "", desired_names)
+    align_idx <- match(desired_base, sample_names_base)
+  }
   if (any(is.na(align_idx))) {
     summary <- list(status = "failed", reason = "Unable to align cell counts with metadata")
     return(list(fractions = NULL, summary = summary))
@@ -815,13 +960,13 @@ estimate_cell_composition <- function(rgset, metadata, platform_label, option, l
   setnames(frac_dt, cell_cols)
   summary <- list(
     status = "ok",
-    method = "estimateCellCounts2",
+    method = method_label %||% "estimateCellCounts",
     reference = "blood",
     platform = reference_platform,
     columns = cell_cols
   )
   if (!is.null(log_fn)) {
-    log_fn("Estimated blood cell composition using %s (%s).", ref_pkg, reference_platform)
+    log_fn("Estimated blood cell composition using %s (%s) via %s.", ref_pkg, reference_platform, method_label %||% "estimateCellCounts")
   }
   list(fractions = frac_dt, summary = summary)
 }
@@ -907,8 +1052,8 @@ generate_covariate_sets <- function(required_numeric, required_factor, optional_
       return(character())
     }
     stats <- copy(stats)
-    stats[, priority := ifelse(is.na(p_value), 1, pmin(1, p_value))]
-    setorder(stats, -priority, score, name)
+    stats[, priority := fifelse(is.na(p_value), Inf, p_value)]
+    setorder(stats, priority, -score, name)
     head(stats$name, max_optional)
   }
   optional_numeric <- prioritise_covariates(optional_numeric_stats, max_optional_numeric)
@@ -1032,14 +1177,29 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
       mod_full <- design_base
       mod0 <- model.matrix(~ 1, data = metadata)
       n_sv <- tryCatch(num.sv(M_minfi, mod_full, method = "leek"), error = function(e) NA_integer_)
+      sample_count <- ncol(M_minfi)
+      design_cols <- ncol(design_base)
+      env_cap <- suppressWarnings(as.integer(Sys.getenv("DEARMETA_MAX_SV", NA_character_)))
+      if (length(env_cap) == 0 || is.na(env_cap)) {
+        env_cap <- NA_integer_
+      }
+      sv_cap <- determine_sva_cap(sample_count, design_cols, env_cap)
       if (is.na(n_sv) || n_sv <= 0) {
         n_sv <- 0L
       } else {
+        if (!is.na(sv_cap) && sv_cap >= 0 && n_sv > sv_cap) {
+          log_message("SVA: reducing surrogate variable count from %s to %s (cap).", n_sv, sv_cap)
+          n_sv <- sv_cap
+        }
+      }
+      if (n_sv > 0) {
         stage <- "compute_sva"
         sva_obj <- sva(M_minfi, mod_full, mod0 = mod0, n.sv = n_sv)
         surrogate_vars <- sva_obj$sv
         surrogate_vars <- as.matrix(surrogate_vars)
         colnames(surrogate_vars) <- paste0("SV", seq_len(ncol(surrogate_vars)))
+      } else {
+        log_message("SVA skipped (requested but cap resolved to zero surrogate variables).")
       }
     }
 
@@ -1076,9 +1236,24 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
         stop(sprintf("batch column %s has fewer than two levels", params$batch_col))
       }
       if (isTRUE(params$use_combat)) {
-        M_minfi_corrected <- apply_combat(M_minfi_sva, metadata, params$batch_col, design_with_sv)
+        if (combat_is_blacklisted(params$batch_col)) {
+          stop(sprintf("ComBat disabled for %s due to previous failure.", params$batch_col))
+        }
+        M_minfi_corrected <- tryCatch(
+          apply_combat(M_minfi_sva, metadata, params$batch_col, design_with_sv),
+          error = function(e) {
+            mark_combat_failure(params$batch_col, conditionMessage(e))
+            stop(e)
+          }
+        )
         if (sesame_available && !is.null(M_sesame_sva)) {
-          M_sesame_corrected <- apply_combat(M_sesame_sva, metadata, params$batch_col, design_with_sv)
+          M_sesame_corrected <- tryCatch(
+            apply_combat(M_sesame_sva, metadata, params$batch_col, design_with_sv),
+            error = function(e) {
+              mark_combat_failure(params$batch_col, conditionMessage(e))
+              stop(e)
+            }
+          )
         }
       }
     } else if (isTRUE(params$use_combat)) {
@@ -1149,7 +1324,8 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
 
     metrics <- list(
       numeric_covars = numeric_final,
-      factor_covars = factor_final,
+      factor_covars = params$factor_covars %||% character(),
+      factor_covars_with_batch = factor_final,
       use_sva = params$use_sva,
       use_combat = params$use_combat,
       batch_col = params$batch_col,
@@ -1774,6 +1950,24 @@ write_plot <- function(plot_obj, filename, width = 7, height = 5) {
   )
 }
 
+write_empty_plot <- function(filename, title, message = "Not enough data to render.", width = 7, height = 5) {
+  png_filename <- paste0(filename, ".png")
+  pdf_filename <- paste0(filename, ".pdf")
+  draw_placeholder <- function(device_fun, file, ...) {
+    device_fun(file, width = width, height = height, ...)
+    op <- par(no.readonly = TRUE)
+    on.exit(par(op), add = TRUE)
+    par(mar = c(0, 0, 0, 0))
+    plot.new()
+    text(0.5, 0.6, labels = title, font = 2, cex = 1.2)
+    text(0.5, 0.4, labels = message, cex = 0.9)
+    invisible(dev.off())
+  }
+  draw_placeholder(png, png_filename, units = "in", res = 300)
+  draw_placeholder(pdf, pdf_filename)
+  log_message("Wrote placeholder plot %s (no data)", filename)
+}
+
 resolve_widget_title <- function(widget) {
   if (inherits(widget, "plotly")) {
     layout_title <- widget$x$layout$title
@@ -2390,50 +2584,59 @@ save_styled_widget <- function(widget, html_path, title = NULL, subtitle = NULL,
 }
 
 create_interactive <- function(plot_obj, filename, title = NULL, subtitle = NULL, description = NULL) {
-  html_path <- paste0(filename, ".html")
-  raw_widget <- plot_obj
-  simple_save <- function(widget_to_save, custom_title = NULL) {
-    htmlwidgets::saveWidget(
-      widget_to_save,
-      file = html_path,
-      selfcontained = FALSE,
-      libdir = paste0(basename(html_path), "_files"),
-      title = custom_title %||% title %||% resolve_widget_title(widget_to_save) %||% format_identifier_title(basename(filename))
-    )
-    html_path
-  }
-  styled_requested <- identical(tolower(Sys.getenv("DEARMETA_STYLED_INTERACTIVE", "")), "true")
-  if (!styled_requested) {
-    return(tryCatch(
-      {
-        log_message("Rendering interactive %s using simplified widget output.", filename)
-        simple_save(raw_widget)
-      },
-      error = function(e) {
-        log_message("Simple interactive save failed for %s: %s", filename, conditionMessage(e))
-        NULL
-      }
-    ))
-  }
   tryCatch(
     {
-      plot_class <- paste(class(plot_obj), collapse = "/")
-      trace_count <- tryCatch(length(plot_obj$x$data), error = function(e) NA_integer_)
-      log_message("Rendering interactive %s (%s) (%s traces)", filename, plot_class, trace_count)
-      save_styled_widget(plot_obj, html_path, title = title, subtitle = subtitle, description = description)
+      html_path <- paste0(filename, ".html")
+      raw_widget <- plot_obj
+      simple_save <- function(widget_to_save, custom_title = NULL) {
+        htmlwidgets::saveWidget(
+          widget_to_save,
+          file = html_path,
+          selfcontained = FALSE,
+          libdir = paste0(basename(html_path), "_files"),
+          title = custom_title %||% title %||% resolve_widget_title(widget_to_save) %||% format_identifier_title(basename(filename))
+        )
+        html_path
+      }
+      styled_requested <- identical(tolower(Sys.getenv("DEARMETA_STYLED_INTERACTIVE", "")), "true")
+      if (!styled_requested) {
+        return(tryCatch(
+          {
+            log_message("Rendering interactive %s using simplified widget output.", filename)
+            simple_save(raw_widget)
+          },
+          error = function(e) {
+            log_message("Simple interactive save failed for %s: %s", filename, conditionMessage(e))
+            NULL
+          }
+        ))
+      }
+      tryCatch(
+        {
+          plot_class <- paste(class(plot_obj), collapse = "/")
+          trace_count <- tryCatch(length(plot_obj$x$data), error = function(e) NA_integer_)
+          log_message("Rendering interactive %s (%s) (%s traces)", filename, plot_class, trace_count)
+          save_styled_widget(plot_obj, html_path, title = title, subtitle = subtitle, description = description)
+        },
+        error = function(e) {
+          trace <- tryCatch(paste(utils::capture.output(traceback()), collapse = " | "), error = function(...) "No traceback available")
+          log_message("Skipping interactive %s due to: %s | Trace: %s", filename, conditionMessage(e), trace)
+          log_message("Attempting unstyled interactive fallback for %s", filename)
+          fallback <- tryCatch(
+            simple_save(raw_widget, custom_title = title),
+            error = function(e2) {
+              log_message("Fallback interactive save failed for %s: %s", filename, conditionMessage(e2))
+              NULL
+            }
+          )
+          fallback
+        }
+      )
     },
     error = function(e) {
       trace <- tryCatch(paste(utils::capture.output(traceback()), collapse = " | "), error = function(...) "No traceback available")
-      log_message("Skipping interactive %s due to: %s | Trace: %s", filename, conditionMessage(e), trace)
-      log_message("Attempting unstyled interactive fallback for %s", filename)
-      fallback <- tryCatch(
-        simple_save(raw_widget, custom_title = title),
-        error = function(e2) {
-          log_message("Fallback interactive save failed for %s: %s", filename, conditionMessage(e2))
-          NULL
-        }
-      )
-      fallback
+      log_message("Fatal interactive failure for %s: %s | Trace: %s", filename, conditionMessage(e), trace)
+      NULL
     }
   )
 }
@@ -3489,13 +3692,18 @@ if (sesame_available && length(sesame_betas) > 0) {
   colnames(beta_sesame) <- mapped_cols
   sesame_poobah <- do.call(cbind, sesame_detp)
   colnames(sesame_poobah) <- mapped_cols
-  sesame_fail_rate <- colMeans(sesame_poobah > POOBAH_FAILURE_THRESHOLD)
-  sesame_flagged <- names(sesame_fail_rate)[sesame_fail_rate > POOBAH_FAILURE_THRESHOLD]
+  sesame_fail_rate <- suppressWarnings(colMeans(sesame_poobah > POOBAH_FAILURE_THRESHOLD, na.rm = TRUE))
+  if (length(sesame_fail_rate) == 0) {
+    sesame_fail_rate <- numeric()
+  } else {
+    sesame_fail_rate[is.nan(sesame_fail_rate)] <- NA_real_
+  }
+  sesame_flagged <- names(sesame_fail_rate)[!is.na(sesame_fail_rate) & sesame_fail_rate > POOBAH_FAILURE_THRESHOLD]
   sample_qc_summary$sesame <- list(
     threshold = POOBAH_FAILURE_THRESHOLD,
     failure_rate = as.list(setNames(round(sesame_fail_rate, 4), colnames(sesame_poobah))),
-    mean_failure = if (length(sesame_fail_rate) > 0) mean(sesame_fail_rate) else NA_real_,
-    max_failure = if (length(sesame_fail_rate) > 0) max(sesame_fail_rate) else NA_real_,
+    mean_failure = if (length(sesame_fail_rate) > 0 && any(!is.na(sesame_fail_rate))) mean(sesame_fail_rate, na.rm = TRUE) else NA_real_,
+    max_failure = if (length(sesame_fail_rate) > 0 && any(!is.na(sesame_fail_rate))) max(sesame_fail_rate, na.rm = TRUE) else NA_real_,
     flagged = sesame_flagged,
     dropped = character()
   )
@@ -3654,6 +3862,7 @@ batch_diagnostics <- list(
   excluded_support = character(),
   excluded_confounded = character(),
   excluded_confounded_detail = list(),
+  excluded_biological = character(),
   manual_excluded = character(),
   manual_insufficient = character(),
   manual_confounded_detail = list()
@@ -3707,8 +3916,12 @@ if (!is.null(det_diag)) {
       batch_diagnostics$excluded_confounded_detail[[nm]] <- det_diag$excluded_confounded_detail[[nm]]
     }
   }
+  if (!is.null(det_diag$excluded_biological)) {
+    batch_diagnostics$excluded_biological <- unique(c(batch_diagnostics$excluded_biological, det_diag$excluded_biological))
+  }
 }
 candidate_batches <- candidate_detection
+candidate_diag <- attr(candidate_detection, "diagnostics")
 auto_batches <- candidate_batches
 if (length(manual_batch_columns) > 0) {
   candidate_batches <- unique(c(manual_batch_columns, candidate_batches))
@@ -3729,12 +3942,15 @@ if (length(candidate_batches) > 0) {
     log_message("Removed batch columns duplicating dear_group from final candidate list: %s", paste(candidate_dropped, collapse = ", "))
   }
   candidate_batches <- candidate_filtered
+  if (!is.null(candidate_diag)) {
+    attr(candidate_batches, "diagnostics") <- candidate_diag
+  }
 }
 
 cell_fraction_columns <- character()
 cell_composition_summary <- list(status = "skipped", reason = "cell composition disabled")
 if ((any(grepl("blood", tolower(config$sample_name %||% ""), fixed = TRUE), na.rm = TRUE)) || detect_blood_signal(config)) {
-  cell_comp_result <- estimate_cell_composition(RGset, config, platform_label, cell_comp_reference)
+cell_comp_result <- estimate_cell_composition(RGset, config, platform_label, cell_comp_reference, target_names = colnames(beta_minfi))
   if (!is.null(cell_comp_result$fractions) && nrow(cell_comp_result$fractions) == nrow(config)) {
     frac_df <- as.data.frame(cell_comp_result$fractions)
     shared_cols <- intersect(names(frac_df), names(config))
@@ -3749,7 +3965,27 @@ if ((any(grepl("blood", tolower(config$sample_name %||% ""), fixed = TRUE), na.r
   cell_composition_summary <- cell_comp_result$summary
 }
 
-covars <- split_covariates(config, candidate_batches, protected_columns)
+confounded_covariates <- character()
+if (!is.null(det_diag) && !is.null(det_diag$excluded_confounded)) {
+  confounded_covariates <- unique(c(confounded_covariates, det_diag$excluded_confounded))
+}
+if (!is.null(det_diag) && !is.null(det_diag$excluded_biological)) {
+  confounded_covariates <- unique(c(confounded_covariates, det_diag$excluded_biological))
+}
+covars <- split_covariates(config, candidate_batches, protected_columns, forbidden_covars = confounded_covariates)
+auto_covariates <- auto_force_covariates(
+  config,
+  blacklist = unique(c(candidate_batches, confounded_covariates)),
+  protected_cols = protected_columns
+)
+if (length(auto_covariates$numeric) > 0) {
+  covars$numeric <- unique(c(covars$numeric, auto_covariates$numeric))
+  log_message("Auto-including numeric covariates (keyword match): %s", paste(auto_covariates$numeric, collapse = ", "))
+}
+if (length(auto_covariates$factor) > 0) {
+  covars$factor <- unique(c(covars$factor, auto_covariates$factor))
+  log_message("Auto-including factor covariates (keyword match): %s", paste(auto_covariates$factor, collapse = ", "))
+}
 if (length(cell_fraction_columns) > 0) {
   covars$numeric <- unique(c(covars$numeric, cell_fraction_columns))
   covars$cell_composition <- cell_fraction_columns
@@ -3780,6 +4016,19 @@ if (length(manual_numeric) > 0) {
     )
     manual_numeric <- setdiff(manual_numeric, numeric_batch_conflicts)
   }
+  numeric_confounded_conflicts <- intersect(manual_numeric, confounded_covariates)
+  if (length(numeric_confounded_conflicts) > 0) {
+    log_message(
+      "Skipping numeric covariates flagged as confounded with dear_group: %s",
+      paste(numeric_confounded_conflicts, collapse = ", ")
+    )
+    manual_numeric <- setdiff(manual_numeric, numeric_confounded_conflicts)
+  }
+}
+cell_fraction_forced <- setdiff(cell_fraction_columns, manual_numeric)
+if (length(cell_fraction_forced) > 0) {
+  manual_numeric <- unique(c(manual_numeric, cell_fraction_forced))
+  log_message("Force-including cell composition covariates: %s", paste(cell_fraction_forced, collapse = ", "))
 }
 if (length(manual_numeric) > 0) {
   covars$numeric <- unique(c(covars$numeric, manual_numeric))
@@ -3800,6 +4049,14 @@ if (length(manual_factor) > 0) {
       paste(factor_batch_conflicts, collapse = ", ")
     )
     manual_factor <- setdiff(manual_factor, factor_batch_conflicts)
+  }
+  factor_confounded_conflicts <- intersect(manual_factor, confounded_covariates)
+  if (length(factor_confounded_conflicts) > 0) {
+    log_message(
+      "Skipping factor covariates flagged as confounded with dear_group: %s",
+      paste(factor_confounded_conflicts, collapse = ", ")
+    )
+    manual_factor <- setdiff(manual_factor, factor_confounded_conflicts)
   }
 }
 if (length(manual_factor) > 0) {
@@ -4300,8 +4557,78 @@ format_gene_field <- function(x) {
     if (length(genes) == 0) NA_character_ else paste(genes, collapse = ";")
   }, USE.NAMES = FALSE)
 }
-annotations_clean[, gene_symbols := format_gene_field(ucsc_refgene_name)]
-annotations_clean[, gene_regions := format_gene_field(ucsc_refgene_group)]
+annotations_clean[, ucsc_refgene_name := format_gene_field(ucsc_refgene_name)]
+annotations_clean[, ucsc_refgene_group := format_gene_field(ucsc_refgene_group)]
+annotations_clean[, gene_symbols := ucsc_refgene_name]
+annotations_clean[, gene_regions := ucsc_refgene_group]
+
+compose_gene_label <- function(gene_symbols, probe_ids) {
+  if (is.null(gene_symbols)) gene_symbols <- character()
+  if (is.null(probe_ids)) probe_ids <- character()
+  len <- max(c(length(gene_symbols), length(probe_ids), 0L))
+  if (len == 0) {
+    return(character())
+  }
+  genes <- rep_len(as.character(gene_symbols), len)
+  probes <- rep_len(as.character(probe_ids), len)
+  genes[is.na(genes)] <- ""
+  probes[is.na(probes)] <- ""
+  has_gene <- nzchar(genes)
+  has_probe <- nzchar(probes)
+  labels <- character(len)
+  labels[has_gene & has_probe] <- paste0(genes[has_gene & has_probe], "_", probes[has_gene & has_probe])
+  labels[!has_gene & has_probe] <- probes[!has_gene & has_probe]
+  labels[has_gene & !has_probe] <- genes[has_gene & !has_probe]
+  labels[!(has_gene | has_probe)] <- ""
+  labels[labels == ""] <- NA_character_
+  labels
+}
+
+select_top_label_rows <- function(df, label_col, adj_col = NULL, p_col = NULL, score_col = NULL, top_n = 10, prefer_high_score = FALSE) {
+  if (is.null(df) || top_n <= 0 || is.null(label_col) || !label_col %in% names(df)) {
+    return(data.frame())
+  }
+  data <- as.data.frame(df)
+  labels <- data[[label_col]]
+  if (is.null(labels)) {
+    return(data.frame())
+  }
+  mask <- !is.na(labels) & labels != ""
+  data <- data[mask, , drop = FALSE]
+  if (nrow(data) == 0) {
+    return(data)
+  }
+  rank_col <- NULL
+  rank_decreasing <- FALSE
+  if (!is.null(adj_col) && adj_col %in% names(data) && any(is.finite(data[[adj_col]]))) {
+    rank_col <- adj_col
+  } else if (!is.null(p_col) && p_col %in% names(data) && any(is.finite(data[[p_col]]))) {
+    rank_col <- p_col
+  } else if (!is.null(score_col) && score_col %in% names(data) && any(is.finite(data[[score_col]]))) {
+    rank_col <- score_col
+    rank_decreasing <- isTRUE(prefer_high_score)
+  }
+  if (is.null(rank_col)) {
+    return(data[seq_len(min(nrow(data), top_n)), , drop = FALSE])
+  }
+  metric <- data[[rank_col]]
+  if (rank_decreasing) {
+    metric <- -metric
+  }
+  tie_values <- NULL
+  if (!is.null(p_col) && p_col %in% names(data) && !identical(p_col, rank_col) && any(is.finite(data[[p_col]]))) {
+    tie_values <- data[[p_col]]
+  }
+  if (!is.null(tie_values)) {
+    ord <- order(metric, tie_values, na.last = NA)
+  } else {
+    ord <- order(metric, na.last = NA)
+  }
+  if (length(ord) == 0) {
+    return(data.frame())
+  }
+  data[head(ord, min(length(ord), top_n)), , drop = FALSE]
+}
 
 annotate_results <- function(res) {
   merge(res, annotations_clean, by = "probe_id", all.x = TRUE, sort = FALSE)
@@ -4461,6 +4788,7 @@ prepare_volcano_data <- function(results, fdr_threshold = opt$fdr_threshold, sam
   if (is.null(results)) {
     return(data.frame())
   }
+  result_names <- names(results) %||% character()
   to_numeric <- function(x) {
     if (is.null(x)) return(rep(NA_real_, length(results[[1]] %||% numeric())))
     as.numeric(x)
@@ -4478,9 +4806,40 @@ prepare_volcano_data <- function(results, fdr_threshold = opt$fdr_threshold, sam
     adj.P.Val = adj_p,
     stringsAsFactors = FALSE
   )
-  if ("probe_id" %in% names(results)) {
+  df$GeneSymbol_cgid <- NA_character_
+  df$gene_symbols <- NA_character_
+  if ("probe_id" %in% result_names) {
     df$probe_id <- as.character(results[["probe_id"]])
   }
+  if ("gene_symbols" %in% result_names) {
+    gene_vals <- results[["gene_symbols"]]
+    if (!is.null(gene_vals) && length(gene_vals) == nrow(df)) {
+      df$gene_symbols <- as.character(gene_vals)
+    }
+  }
+  label_candidates <- c("GeneSymbol_cgid", "genesymbol_cgid")
+  for (candidate in label_candidates) {
+    if (candidate %in% result_names) {
+      label_vals <- results[[candidate]]
+      if (!is.null(label_vals) && length(label_vals) == nrow(df)) {
+        df$GeneSymbol_cgid <- as.character(label_vals)
+        break
+      }
+    }
+  }
+  if (all(is.na(df$gene_symbols)) && "probe_id" %in% names(df) && exists("annotations_clean", inherits = TRUE)) {
+    gene_lookup <- tryCatch(
+      {
+        match_idx <- match(df$probe_id, annotations_clean$probe_id)
+        as.character(annotations_clean$gene_symbols[match_idx])
+      },
+      error = function(e) rep(NA_character_, nrow(df))
+    )
+    df$gene_symbols <- gene_lookup
+  }
+  derived_labels <- compose_gene_label(df$gene_symbols, df$probe_id)
+  needs_label <- is.na(df$GeneSymbol_cgid) | df$GeneSymbol_cgid == ""
+  df$GeneSymbol_cgid[needs_label] <- derived_labels[needs_label]
   valid_mask <- is.finite(df$delta_beta) & is.finite(df$P.Value) & is.finite(df$adj.P.Val)
   df <- df[valid_mask, , drop = FALSE]
   if (nrow(df) == 0) {
@@ -4488,11 +4847,42 @@ prepare_volcano_data <- function(results, fdr_threshold = opt$fdr_threshold, sam
   }
   df$P.Value <- pmax(df$P.Value, .Machine$double.xmin)
   df$adj.P.Val <- pmax(df$adj.P.Val, .Machine$double.xmin)
+  df$neg_log_p <- -log10(df$P.Value)
+  df$.plot_row_id <- seq_len(nrow(df))
+  priority_idx <- integer(0)
+  if (any(!is.na(df$GeneSymbol_cgid) & df$GeneSymbol_cgid != "")) {
+    top_rows <- select_top_label_rows(
+      df,
+      label_col = "GeneSymbol_cgid",
+      adj_col = "adj.P.Val",
+      p_col = "P.Value",
+      score_col = "neg_log_p",
+      top_n = 10,
+      prefer_high_score = TRUE
+    )
+    if (nrow(top_rows) > 0 && ".plot_row_id" %in% names(top_rows)) {
+      priority_idx <- unique(top_rows$.plot_row_id)
+    }
+  }
   if (nrow(df) > sample_size) {
     set.seed(1234)
-    df <- df[sample.int(nrow(df), sample_size), , drop = FALSE]
+    total_idx <- seq_len(nrow(df))
+    if (length(priority_idx) > 0) {
+      priority_idx <- priority_idx[priority_idx %in% total_idx]
+      remaining <- setdiff(total_idx, priority_idx)
+      needed <- max(sample_size - length(priority_idx), 0L)
+      random_idx <- if (needed > 0 && length(remaining) > 0) {
+        sample(remaining, min(needed, length(remaining)))
+      } else {
+        integer(0)
+      }
+      keep_idx <- sort(unique(c(priority_idx, random_idx)))
+    } else {
+      keep_idx <- sample(total_idx, sample_size)
+    }
+    df <- df[keep_idx, , drop = FALSE]
   }
-  df$neg_log_p <- -log10(df$P.Value)
+  df$.plot_row_id <- NULL
   sig_flag <- if (!is.null(fdr_threshold) && length(fdr_threshold) == 1 && is.finite(fdr_threshold)) {
     df$adj.P.Val <= fdr_threshold
   } else {
@@ -4516,7 +4906,16 @@ volcano_plot <- function(results, title, fdr_threshold = opt$fdr_threshold) {
     return(ggplot() + theme_void() + labs(title = paste(title, "(insufficient data)")))
   }
   log_message("volcano_plot %s: downsampled to %s rows for plotting", title, nrow(df))
-  ggplot(df, aes(x = delta_beta, y = neg_log_p, color = significant)) +
+  label_df <- select_top_label_rows(
+    df,
+    label_col = "GeneSymbol_cgid",
+    adj_col = "adj.P.Val",
+    p_col = "P.Value",
+    score_col = "neg_log_p",
+    top_n = 10,
+    prefer_high_score = TRUE
+  )
+  plot_obj <- ggplot(df, aes(x = delta_beta, y = neg_log_p, color = significant)) +
     geom_point(alpha = 0.6) +
     scale_color_manual(
       values = c(not_sig = "grey60", sig = "firebrick"),
@@ -4527,6 +4926,19 @@ volcano_plot <- function(results, title, fdr_threshold = opt$fdr_threshold) {
     ) +
     theme_minimal() +
     labs(title = title, x = "Delta beta", y = "-log10(p-value)", color = paste0("FDR<=", signif(fdr_threshold)))
+  if (nrow(label_df) > 0) {
+    plot_obj <- plot_obj +
+      ggrepel::geom_text_repel(
+        data = label_df,
+        aes(x = delta_beta, y = neg_log_p, label = GeneSymbol_cgid),
+        inherit.aes = FALSE,
+        show.legend = FALSE,
+        max.overlaps = Inf,
+        min.segment.length = 0,
+        size = 3
+      )
+  }
+  plot_obj
 }
 
 write_volcano_base <- function(results, title, filename, width = 7, height = 5) {
@@ -4573,13 +4985,29 @@ build_volcano_plotly <- function(results, title, fdr_threshold = opt$fdr_thresho
     return(NULL)
   }
   colors <- c(not_sig = "grey60", sig = "firebrick")
+  label_df <- select_top_label_rows(
+    df,
+    label_col = "GeneSymbol_cgid",
+    adj_col = "adj.P.Val",
+    p_col = "P.Value",
+    score_col = "neg_log_p",
+    top_n = 10,
+    prefer_high_score = TRUE
+  )
+  label_str <- if (!is.null(df$GeneSymbol_cgid)) {
+    safe_label <- ifelse(is.na(df$GeneSymbol_cgid) | df$GeneSymbol_cgid == "", NA_character_, df$GeneSymbol_cgid)
+    ifelse(is.na(safe_label), "", paste0("<br>Label: ", safe_label))
+  } else {
+    ""
+  }
   tooltip <- paste0(
     "Δβ: ", sprintf("%.3f", df$delta_beta),
     "<br>-log10(p-value): ", sprintf("%.2f", df$neg_log_p),
     "<br>FDR: ", sprintf("%.3g", df$adj.P.Val),
-    if (!is.null(df$probe_id)) paste0("<br>CpG: ", df$probe_id) else ""
+    if (!is.null(df$probe_id)) paste0("<br>CpG: ", df$probe_id) else "",
+    label_str
   )
-  plotly::plot_ly(
+  plot_obj <- plotly::plot_ly(
     df,
     x = ~delta_beta,
     y = ~neg_log_p,
@@ -4596,6 +5024,22 @@ build_volcano_plotly <- function(results, title, fdr_threshold = opt$fdr_thresho
       xaxis = list(title = "Delta beta"),
       yaxis = list(title = "-log10(p-value)")
     )
+  if (nrow(label_df) > 0) {
+    plot_obj <- plotly::add_trace(
+      plot_obj,
+      data = label_df,
+      x = ~delta_beta,
+      y = ~neg_log_p,
+      type = "scatter",
+      mode = "text",
+      text = ~GeneSymbol_cgid,
+      textposition = "top center",
+      showlegend = FALSE,
+      hoverinfo = "none",
+      textfont = list(color = "#222222", size = 10)
+    )
+  }
+  plot_obj
 }
 
 write_volcano_plotly <- function(results, title, filename) {
@@ -4725,7 +5169,12 @@ log_message("volcano_sesame rows: %s (finite adj.P.Val: %s)", nrow(results_sesam
 if (!write_plot(volcano_plot(results_sesame, "Volcano sesame"), file.path(fig_dir, "volcano_sesame"))) {
   write_volcano_base(results_sesame, "Volcano sesame", file.path(fig_dir, "volcano_sesame"))
 }
-write_plot(volcano_plot(integrated$intersection, "Volcano intersection"), file.path(fig_dir, "volcano_intersection"))
+if (nrow(integrated$intersection) > 0) {
+  write_plot(volcano_plot(integrated$intersection, "Volcano intersection"), file.path(fig_dir, "volcano_intersection"))
+} else {
+  log_message("Skipping volcano intersection static plot: no shared CpGs available.")
+  write_empty_plot(file.path(fig_dir, "volcano_intersection"), "Volcano intersection", "No shared CpGs passed the filters.")
+}
 
 density_plot <- function(beta_matrix, title) {
   df <- melt(as.data.table(beta_matrix, keep.rownames = "probe_id"), id.vars = "probe_id", variable.name = "sample", value.name = "beta")
@@ -4764,16 +5213,16 @@ if (sesame_available && !is.null(beta_sesame)) {
   write_plot(boxplot_plot(beta_sesame, "Beta boxplot sesame"), file.path(fig_dir, "boxplot_betas_sesame"))
 }
 
-manhattan_plot <- function(res, title) {
+prepare_manhattan_df <- function(res) {
   df <- as.data.table(res)
   setnames(df, names(df), tolower(names(df)))
   required <- c("p.value", "mapinfo", "chr")
   if (!all(required %in% names(df))) {
-    return(ggplot() + theme_void() + labs(title = paste(title, "(not available)")))
+    return(list(data = NULL, reason = "not available"))
   }
   df <- df[!is.na(p.value) & !is.na(mapinfo) & !is.na(chr)]
   if (nrow(df) == 0) {
-    return(ggplot() + theme_void() + labs(title = paste(title, "(insufficient data)")))
+    return(list(data = NULL, reason = "insufficient data"))
   }
   df[, chr_num := as.numeric(gsub("chr", "", chr, ignore.case = TRUE))]
   df[is.na(chr_num) & grepl("x", chr, ignore.case = TRUE), chr_num := 23]
@@ -4803,19 +5252,106 @@ manhattan_plot <- function(res, title) {
     delta_str,
     logfc_str
   )]
+  existing_labels <- if ("genesymbol_cgid" %in% names(df)) df$genesymbol_cgid else rep(NA_character_, nrow(df))
+  derived_labels <- compose_gene_label(gene_vals, df$probe_id)
+  replace_idx <- is.na(existing_labels) | existing_labels == ""
+  existing_labels[replace_idx] <- derived_labels[replace_idx]
+  df[, genesymbol_cgid := existing_labels]
   centers <- df[, .(center = mean(index)), by = chr_num]
-  ggplot(df, aes(x = index, y = neg_log10_p, color = factor(chr_num %% 2), text = tooltip)) +
+  label_df <- select_top_label_rows(
+    df,
+    label_col = "genesymbol_cgid",
+    adj_col = "adj.p.val",
+    p_col = "p.value",
+    score_col = "neg_log10_p",
+    top_n = 10,
+    prefer_high_score = TRUE
+  )
+  list(data = df, centers = centers, label_df = label_df, reason = NULL)
+}
+
+manhattan_plot <- function(res, title) {
+  prep <- prepare_manhattan_df(res)
+  if (is.null(prep$data)) {
+    reason <- prep$reason %||% "insufficient data"
+    return(ggplot() + theme_void() + labs(title = paste(title, sprintf("(%s)", reason))))
+  }
+  df <- prep$data
+  centers <- prep$centers
+  label_df <- prep$label_df
+  plot_manhattan <- ggplot(df, aes(x = index, y = neg_log10_p, color = factor(chr_num %% 2), text = tooltip)) +
     geom_point(alpha = 0.6, size = 0.7) +
     scale_x_continuous(breaks = centers$center, labels = centers$chr_num) +
     scale_color_manual(values = c("#1f77b4", "#ff7f0e")) +
     theme_minimal() +
     theme(legend.position = "none") +
     labs(title = title, x = "Chromosome", y = "-log10(p-value)")
+  if (nrow(label_df) > 0) {
+    plot_manhattan <- plot_manhattan +
+      ggrepel::geom_text_repel(
+        data = label_df,
+        aes(x = index, y = neg_log10_p, label = genesymbol_cgid),
+        inherit.aes = FALSE,
+        show.legend = FALSE,
+        max.overlaps = Inf,
+        min.segment.length = 0,
+        size = 3
+      )
+  }
+  plot_manhattan
+}
+
+build_manhattan_plotly <- function(res, title) {
+  prep <- prepare_manhattan_df(res)
+  if (is.null(prep$data)) {
+    return(NULL)
+  }
+  df <- prep$data
+  label_df <- prep$label_df
+  color_map <- c("0" = "#1f77b4", "1" = "#ff7f0e")
+  plot_obj <- plotly::plot_ly(
+    df,
+    x = ~index,
+    y = ~neg_log10_p,
+    type = "scattergl",
+    mode = "markers",
+    color = ~factor(chr_num %% 2),
+    colors = color_map,
+    text = ~tooltip,
+    hoverinfo = "text",
+    marker = list(size = 6, opacity = 0.6)
+  ) %>%
+    plotly::layout(
+      title = title,
+      xaxis = list(title = "Chromosome", tickmode = "array", tickvals = prep$centers$center, ticktext = prep$centers$chr_num),
+      yaxis = list(title = "-log10(p-value)")
+    )
+  if (nrow(label_df) > 0) {
+    plot_obj <- plotly::add_trace(
+      plot_obj,
+      data = label_df,
+      x = ~index,
+      y = ~neg_log10_p,
+      type = "scatter",
+      mode = "text",
+      text = ~genesymbol_cgid,
+      textposition = "top center",
+      textfont = list(color = "#222222", size = 10),
+      hoverinfo = "none",
+      showlegend = FALSE
+    )
+  }
+  plot_obj
 }
 
 write_plot(manhattan_plot(annotated_minfi, "Manhattan minfi"), file.path(fig_dir, "manhattan_minfi"))
 write_plot(manhattan_plot(annotated_sesame, "Manhattan sesame"), file.path(fig_dir, "manhattan_sesame"))
-write_plot(manhattan_plot(annotated_intersection, "Manhattan intersection"), file.path(fig_dir, "manhattan_intersection"))
+if (nrow(annotated_intersection) > 0) {
+  write_plot(manhattan_plot(annotated_intersection, "Manhattan intersection"), file.path(fig_dir, "manhattan_intersection"))
+} else {
+  log_message("Skipping Manhattan intersection static plot: no shared CpGs available.")
+  write_empty_plot(file.path(fig_dir, "manhattan_intersection"), "Manhattan intersection", "No shared CpGs passed the filters.")
+}
 
 qq_plot <- function(res, title) {
   df <- as.data.frame(res)
@@ -4873,9 +5409,21 @@ interactive_dir <- paths$interactive
 
 interactive_files <- list()
 
-if (!is.null(model_evaluation_table_export) && nrow(model_evaluation_table_export) > 0) {
-  eval_display <- copy(model_evaluation_table_export)
-  setorder(eval_display, rank, model_id)
+guard_interactive <- function(label, expr) {
+  tryCatch(
+    force(expr),
+    error = function(e) {
+      trace <- tryCatch(paste(utils::capture.output(traceback()), collapse = " | "), error = function(...) "No traceback available")
+      log_message("Interactive output %s failed: %s | Trace: %s", label, conditionMessage(e), trace)
+      NULL
+    }
+  )
+}
+
+guard_interactive("model_selection_table", {
+  if (!is.null(model_evaluation_table_export) && nrow(model_evaluation_table_export) > 0) {
+    eval_display <- copy(model_evaluation_table_export)
+    setorder(eval_display, rank, model_id)
   display_cols <- c(
     "rank", "model_id", "status", "batch_col", "batch_in_design",
     "use_combat", "use_sva", "n_covariates_numeric", "n_covariates_factor",
@@ -4915,96 +5463,42 @@ if (!is.null(model_evaluation_table_export) && nrow(model_evaluation_table_expor
     subtitle = meta$subtitle,
     description = meta$description
   )
-  if (!is.null(path)) interactive_files$model_selection_table <- path
-}
-meta <- interactive_output_metadata("pca_pre")
-path <- create_interactive(
-  ggplotly(pca_plots[[1]]),
-  file.path(interactive_dir, "pca_pre"),
-  title = meta$title,
-  subtitle = meta$subtitle,
-  description = meta$description
-)
-if (!is.null(path)) interactive_files$pca_pre <- path
-meta <- interactive_output_metadata("pca_post")
-if (!minfi_correction_applied) {
-  meta$title <- paste0(meta$title, " · no correction")
-  meta$subtitle <- "No batch/SVA adjustment was applied; plot matches the pre-correction PCA."
-}
-path <- create_interactive(
-  ggplotly(pca_plots[[2]]),
-  file.path(interactive_dir, "pca_post"),
-  title = meta$title,
-  subtitle = meta$subtitle,
-  description = meta$description
-)
-if (!is.null(path)) interactive_files$pca_post <- path
-meta <- interactive_output_metadata("volcano_minfi")
-volcano_minfi_widget <- build_volcano_plotly(annotated_minfi, "Volcano minfi")
-if (!is.null(volcano_minfi_widget)) {
+    if (!is.null(path)) interactive_files$model_selection_table <- path
+  }
+})
+guard_interactive("pca_pre", {
+  meta <- interactive_output_metadata("pca_pre")
   path <- create_interactive(
-    volcano_minfi_widget,
-    file.path(interactive_dir, "volcano_minfi"),
+    ggplotly(pca_plots[[1]]),
+    file.path(interactive_dir, "pca_pre"),
     title = meta$title,
     subtitle = meta$subtitle,
     description = meta$description
   )
-} else {
-  path <- NULL
-}
-if (!is.null(path)) {
-  interactive_files$volcano_minfi <- path
-} else {
-  fallback <- write_volcano_plotly(annotated_minfi, "Volcano minfi", file.path(interactive_dir, "volcano_minfi"))
-  if (!is.null(fallback)) interactive_files$volcano_minfi <- fallback
-}
-meta <- interactive_output_metadata("volcano_intersection")
-volcano_intersection_widget <- build_volcano_plotly(integrated$intersection, "Volcano intersection")
-if (!is.null(volcano_intersection_widget)) {
+  if (!is.null(path)) interactive_files$pca_pre <- path
+})
+guard_interactive("pca_post", {
+  meta <- interactive_output_metadata("pca_post")
+  if (!minfi_correction_applied) {
+    meta$title <- paste0(meta$title, " · no correction")
+    meta$subtitle <- "No batch/SVA adjustment was applied; plot matches the pre-correction PCA."
+  }
   path <- create_interactive(
-    volcano_intersection_widget,
-    file.path(interactive_dir, "volcano_intersection"),
+    ggplotly(pca_plots[[2]]),
+    file.path(interactive_dir, "pca_post"),
     title = meta$title,
     subtitle = meta$subtitle,
     description = meta$description
   )
-  if (!is.null(path)) interactive_files$volcano_intersection <- path
-}
-meta <- interactive_output_metadata("manhattan_minfi")
-path <- create_interactive(
-  ggplotly(manhattan_plot(annotated_minfi, "Manhattan minfi")),
-  file.path(interactive_dir, "manhattan_minfi"),
-  title = meta$title,
-  subtitle = meta$subtitle,
-  description = meta$description
-)
-if (!is.null(path)) interactive_files$manhattan_minfi <- path
-meta <- interactive_output_metadata("manhattan_intersection")
-path <- create_interactive(
-  ggplotly(manhattan_plot(annotated_intersection, "Manhattan intersection")),
-  file.path(interactive_dir, "manhattan_intersection"),
-  title = meta$title,
-  subtitle = meta$subtitle,
-  description = meta$description
-)
-if (!is.null(path)) interactive_files$manhattan_intersection <- path
-
-meta <- interactive_output_metadata("table_minfi")
-path <- write_table_widget(
-  annotated_minfi,
-  file.path(interactive_dir, "table_minfi"),
-  title = meta$title,
-  subtitle = meta$subtitle,
-  description = meta$description
-)
-if (!is.null(path)) interactive_files$table_minfi <- path
-if (sesame_available && nrow(results_sesame) > 0) {
-  meta <- interactive_output_metadata("volcano_sesame")
-  volcano_sesame_widget <- build_volcano_plotly(annotated_sesame, "Volcano sesame")
-  if (!is.null(volcano_sesame_widget)) {
+  if (!is.null(path)) interactive_files$pca_post <- path
+})
+guard_interactive("volcano_minfi", {
+  meta <- interactive_output_metadata("volcano_minfi")
+  volcano_minfi_widget <- build_volcano_plotly(annotated_minfi, "Volcano minfi")
+  if (!is.null(volcano_minfi_widget)) {
     path <- create_interactive(
-      volcano_sesame_widget,
-      file.path(interactive_dir, "volcano_sesame"),
+      volcano_minfi_widget,
+      file.path(interactive_dir, "volcano_minfi"),
       title = meta$title,
       subtitle = meta$subtitle,
       description = meta$description
@@ -5013,49 +5507,137 @@ if (sesame_available && nrow(results_sesame) > 0) {
     path <- NULL
   }
   if (!is.null(path)) {
-    interactive_files$volcano_sesame <- path
+    interactive_files$volcano_minfi <- path
   } else {
-    fallback <- write_volcano_plotly(annotated_sesame, "Volcano sesame", file.path(interactive_dir, "volcano_sesame"))
-    if (!is.null(fallback)) interactive_files$volcano_sesame <- fallback
+    fallback <- write_volcano_plotly(annotated_minfi, "Volcano minfi", file.path(interactive_dir, "volcano_minfi"))
+    if (!is.null(fallback)) interactive_files$volcano_minfi <- fallback
   }
-  meta <- interactive_output_metadata("manhattan_sesame")
-  path <- create_interactive(
-    ggplotly(manhattan_plot(annotated_sesame, "Manhattan sesame")),
-    file.path(interactive_dir, "manhattan_sesame"),
-    title = meta$title,
-    subtitle = meta$subtitle,
-    description = meta$description
-  )
-  if (!is.null(path)) interactive_files$manhattan_sesame <- path
-  meta <- interactive_output_metadata("table_sesame")
-  path <- write_table_widget(
-    annotated_sesame,
-    file.path(interactive_dir, "table_sesame"),
-    title = meta$title,
-    subtitle = meta$subtitle,
-    description = meta$description
-  )
-  if (!is.null(path)) interactive_files$table_sesame <- path
-}
-meta <- interactive_output_metadata("table_intersection")
-path <- write_table_widget(
-  annotated_intersection,
-  file.path(interactive_dir, "table_intersection"),
-  title = meta$title,
-  subtitle = meta$subtitle,
-  description = meta$description
-)
-if (!is.null(path)) interactive_files$table_intersection <- path
+})
+guard_interactive("volcano_intersection", {
+  meta <- interactive_output_metadata("volcano_intersection")
+  volcano_intersection_widget <- build_volcano_plotly(integrated$intersection, "Volcano intersection")
+  if (!is.null(volcano_intersection_widget)) {
+    path <- create_interactive(
+      volcano_intersection_widget,
+      file.path(interactive_dir, "volcano_intersection"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$volcano_intersection <- path
+  }
+})
+guard_interactive("manhattan_minfi", {
+  meta <- interactive_output_metadata("manhattan_minfi")
+  manhattan_minfi_widget <- build_manhattan_plotly(annotated_minfi, "Manhattan minfi")
+  if (!is.null(manhattan_minfi_widget)) {
+    path <- create_interactive(
+      manhattan_minfi_widget,
+      file.path(interactive_dir, "manhattan_minfi"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$manhattan_minfi <- path
+  }
+})
+guard_interactive("manhattan_intersection", {
+  meta <- interactive_output_metadata("manhattan_intersection")
+  manhattan_intersection_widget <- build_manhattan_plotly(annotated_intersection, "Manhattan intersection")
+  if (!is.null(manhattan_intersection_widget)) {
+    path <- create_interactive(
+      manhattan_intersection_widget,
+      file.path(interactive_dir, "manhattan_intersection"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$manhattan_intersection <- path
+  }
+})
 
-meta <- interactive_output_metadata("table_intersection_dual")
-path <- write_table_widget(
-  annotated_shared,
-  file.path(interactive_dir, "table_intersection_dual"),
-  title = meta$title,
-  subtitle = meta$subtitle,
-  description = meta$description
-)
-if (!is.null(path)) interactive_files$table_intersection_dual <- path
+guard_interactive("table_minfi", {
+  meta <- interactive_output_metadata("table_minfi")
+  path <- write_table_widget(
+    annotated_minfi,
+    file.path(interactive_dir, "table_minfi"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$table_minfi <- path
+})
+if (sesame_available && nrow(results_sesame) > 0) {
+  guard_interactive("volcano_sesame", {
+    meta <- interactive_output_metadata("volcano_sesame")
+    volcano_sesame_widget <- build_volcano_plotly(annotated_sesame, "Volcano sesame")
+    if (!is.null(volcano_sesame_widget)) {
+      path <- create_interactive(
+        volcano_sesame_widget,
+        file.path(interactive_dir, "volcano_sesame"),
+        title = meta$title,
+        subtitle = meta$subtitle,
+        description = meta$description
+      )
+    } else {
+      path <- NULL
+    }
+    if (!is.null(path)) {
+      interactive_files$volcano_sesame <- path
+    } else {
+      fallback <- write_volcano_plotly(annotated_sesame, "Volcano sesame", file.path(interactive_dir, "volcano_sesame"))
+      if (!is.null(fallback)) interactive_files$volcano_sesame <- fallback
+    }
+  })
+  guard_interactive("manhattan_sesame", {
+    meta <- interactive_output_metadata("manhattan_sesame")
+    manhattan_sesame_widget <- build_manhattan_plotly(annotated_sesame, "Manhattan sesame")
+    if (!is.null(manhattan_sesame_widget)) {
+      path <- create_interactive(
+        manhattan_sesame_widget,
+        file.path(interactive_dir, "manhattan_sesame"),
+        title = meta$title,
+        subtitle = meta$subtitle,
+        description = meta$description
+      )
+      if (!is.null(path)) interactive_files$manhattan_sesame <- path
+    }
+  })
+  guard_interactive("table_sesame", {
+    meta <- interactive_output_metadata("table_sesame")
+    path <- write_table_widget(
+      annotated_sesame,
+      file.path(interactive_dir, "table_sesame"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$table_sesame <- path
+  })
+}
+guard_interactive("table_intersection", {
+  meta <- interactive_output_metadata("table_intersection")
+  path <- write_table_widget(
+    annotated_intersection,
+    file.path(interactive_dir, "table_intersection"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$table_intersection <- path
+})
+
+guard_interactive("table_intersection_dual", {
+  meta <- interactive_output_metadata("table_intersection_dual")
+  path <- write_table_widget(
+    annotated_shared,
+    file.path(interactive_dir, "table_intersection_dual"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$table_intersection_dual <- path
+})
 
 # ---- Summary ----------------------------------------------------------------
 

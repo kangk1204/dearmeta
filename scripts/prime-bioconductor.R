@@ -39,6 +39,8 @@ preload <- c(
   "GenomicFeatures",
   "AnnotationHub",
   "ExperimentHub",
+  "FlowSorted.Blood.EPIC",
+  "FlowSorted.Blood.450k",
   "BSgenome",
   "ShortRead",
   "cigarillo",

@@ -41,6 +41,18 @@ CANDIDATE_BATCH_KEYS = {
 MIN_BATCH_NONMISSING_RATIO = 0.5
 MIN_BATCH_LEVEL_SIZE = 2
 PROTECTED_BATCH_KEYWORDS = ("sex", "gender")
+BIOLOGICAL_BATCH_KEYWORDS = {
+    "tissue",
+    "disease",
+    "diagnosis",
+    "treatment",
+    "dose",
+    "timepoint",
+    "cell",
+    "cellline",
+    "phenotype",
+    "lineage",
+}
 SENTRIX_PATTERN = re.compile(r"_(\d{8,12})_(R\d{2}C\d{2})", re.IGNORECASE)
 
 
@@ -51,6 +63,11 @@ def _normalize_name(name: str) -> str:
 def _is_protected_column(name: str) -> bool:
     normalized = _normalize_name(name)
     return any(keyword in normalized for keyword in PROTECTED_BATCH_KEYWORDS)
+
+
+def _looks_biological_batch(name: str) -> bool:
+    normalized = _normalize_name(name)
+    return any(keyword in normalized for keyword in BIOLOGICAL_BATCH_KEYWORDS)
 
 
 def _has_sufficient_batch_support(series: pd.Series, total_len: int) -> bool:
@@ -144,6 +161,8 @@ def infer_column_types(frame: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Li
             frame[column] = series
             categorical_cols.append(column)
         if _is_protected_column(column):
+            continue
+        if _looks_biological_batch(column):
             continue
         supports_batch = _has_sufficient_batch_support(series_clean.dropna(), len(series))
         if not supports_batch:
