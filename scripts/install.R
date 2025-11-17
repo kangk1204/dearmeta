@@ -7,6 +7,7 @@ cran_packages <- c(
   jsonlite = "2.0.0",
   "data.table" = "1.17.8",
   ggplot2 = "4.0.0",
+  ggrepel = "0.9.6",
   plotly = "4.11.0",
   htmlwidgets = "1.6.4",
   DT = "0.34.0",
