@@ -58,7 +58,7 @@ cd dearmeta
 ```bash
 Rscript scripts/prime-bioconductor.R
 ```
-This script installs `BiocManager`, pins Bioconductor 3.22, and preloads the heavy genomics stack so Bootstrap finishes faster. Inspect the script if you want to reproduce the commands manually.
+This script installs `BiocManager`, pins Bioconductor 3.22, preloads the heavy genomics stack **and caches FlowSorted blood references (EPIC/450k)** so bootstrap runs and blood cell-composition inference do not need to download them later. Inspect the script if you want to reproduce the commands manually.
 
 ### 5. Run the bootstrap script
 ```bash
@@ -146,6 +146,7 @@ Again, confirm the `renv` library path in the R output.
 - `--drop-sesame-failed` removes samples whose sesame failure rate exceeds the threshold before continuing.
 - Batch/sample processing currently runs serially for stability; there is no parallel worker flag to configure.
 - See `docs/statistical_assumptions.md` for citations supporting every QC/batch threshold shipped with DearMeta.
+- Batch/covariate heuristics: biology-driven columns (tissue, treatment, disease, cell*) are blocked from being auto-batch; candidates that duplicate `dear_group` or lack cross-group replication are excluded. ComBat is only attempted when the batch is non-confounded; after a singular fit the batch is blacklisted for the run. SVA surrogate count is capped by degrees-of-freedom (override with `DEARMETA_MAX_SV`) to prevent overfitting.
 
 ### Cell composition (blood datasets)
 - DearMeta can now estimate leukocyte fractions via the Houseman/IDOL method (`minfi::estimateCellCounts2`).
