@@ -1322,6 +1322,22 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
     group_stats <- pca_minfi_post$assessments[variable == "dear_group"]
     group_median_p <- if (nrow(group_stats) > 0) median(group_stats$p_value, na.rm = TRUE) else NA_real_
 
+    raw_sig_minfi <- if (!is.null(results_minfi) && nrow(results_minfi) > 0) {
+      sum(results_minfi$P.Value < 0.01, na.rm = TRUE)
+    } else {
+      0L
+    }
+    raw_sig_sesame <- if (!is.null(results_sesame) && is.data.frame(results_sesame) && nrow(results_sesame) > 0) {
+      sum(results_sesame$P.Value < 0.01, na.rm = TRUE)
+    } else {
+      0L
+    }
+    raw_sig_intersection <- if (raw_sig_minfi > 0 && raw_sig_sesame > 0) {
+      min(raw_sig_minfi, raw_sig_sesame)
+    } else {
+      0L
+    }
+
     metrics <- list(
       numeric_covars = numeric_final,
       factor_covars = params$factor_covars %||% character(),
@@ -1346,7 +1362,10 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
       group_median_p = group_median_p,
       n_sig_minfi = nrow(sig_minfi),
       n_sig_sesame = nrow(sig_sesame),
-      n_sig_intersection = sig_intersection
+      n_sig_intersection = sig_intersection,
+      raw_sig_minfi = as.integer(raw_sig_minfi),
+      raw_sig_sesame = as.integer(raw_sig_sesame),
+      raw_sig_intersection = as.integer(raw_sig_intersection)
     )
 
     outputs <- NULL
@@ -1472,7 +1491,10 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
       group_median_p = if (!is.null(metrics)) metrics$group_median_p else NA_real_,
       n_sig_minfi = if (!is.null(metrics)) metrics$n_sig_minfi else NA_integer_,
       n_sig_sesame = if (!is.null(metrics)) metrics$n_sig_sesame else NA_integer_,
-      n_sig_intersection = if (!is.null(metrics)) metrics$n_sig_intersection else NA_integer_
+      n_sig_intersection = if (!is.null(metrics)) metrics$n_sig_intersection else NA_integer_,
+      raw_sig_minfi = if (!is.null(metrics)) metrics$raw_sig_minfi else NA_integer_,
+      raw_sig_sesame = if (!is.null(metrics)) metrics$raw_sig_sesame else NA_integer_,
+      raw_sig_intersection = if (!is.null(metrics)) metrics$raw_sig_intersection else NA_integer_
     )
   }
   evaluation_dt <- rbindlist(evaluation, fill = TRUE)
@@ -1514,6 +1536,9 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
     -n_sig_intersection,
     -n_sig_minfi,
     -n_sig_sesame,
+    -raw_sig_intersection,
+    -raw_sig_minfi,
+    -raw_sig_sesame,
     -batch_score,
     -selected_batch_delta_minfi,
     -selected_batch_delta_sesame,
