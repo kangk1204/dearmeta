@@ -38,6 +38,7 @@ option_list <- list(
   make_option("--min-group-size", type = "integer", dest = "min_group_size", default = 2, help = "Minimum samples per group"),
   make_option("--group-ref", type = "character", dest = "group_ref", default = NULL, help = "Group label to use as the reference/baseline for contrasts"),
   make_option("--fdr-threshold", type = "double", dest = "fdr_threshold", default = 0.05, help = "Adjusted p-value threshold"),
+  make_option("--p-threshold", type = "double", dest = "p_threshold", default = 1.0, help = "Raw p-value threshold (set <=1 to optionally gate significance by unadjusted p-value)."),
   make_option("--delta-beta-threshold", type = "double", dest = "delta_beta_threshold", default = 0.05, help = "Absolute delta-beta threshold"),
   make_option("--top-n-cpgs", type = "integer", dest = "top_n_cpgs", default = 10000, help = "Number of CpGs to retain for plots/tables"),
   make_option("--poobah-threshold", type = "double", dest = "poobah_threshold", default = 0.05, help = "Sesame pOOBAH failure threshold."),
@@ -64,6 +65,9 @@ if (is.null(opt$top_n_cpgs) || length(opt$top_n_cpgs) == 0) {
 
 if (is.null(opt$poobah_threshold) || !is.finite(opt$poobah_threshold) || opt$poobah_threshold <= 0 || opt$poobah_threshold >= 1) {
   stop("--poobah-threshold must be between 0 and 1")
+}
+if (is.null(opt$p_threshold) || !is.finite(opt$p_threshold) || opt$p_threshold <= 0 || opt$p_threshold > 1) {
+  stop("--p-threshold must be between 0 and 1 (inclusive of 1)")
 }
 
 POOBAH_FAILURE_THRESHOLD <- opt$poobah_threshold
@@ -1368,8 +1372,10 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
     }
 
     stage <- "metric_collection"
-    sig_minfi <- filter_significant(results_minfi, opt$fdr_threshold, opt$delta_beta_threshold)
-    sig_sesame <- filter_significant(results_sesame, opt$fdr_threshold, opt$delta_beta_threshold)
+    # For design optimisation, keep significance thresholds fixed to the defaults
+    # so ranking is stable regardless of user-provided reporting cutoffs.
+    sig_minfi <- filter_significant(results_minfi, 0.05, 0.05, 1)
+    sig_sesame <- filter_significant(results_sesame, 0.05, 0.05, 1)
     sig_intersection <- nrow(shared_probe_keys(sig_minfi, sig_sesame))
     batch_median_p_minfi <- batch_minfi_post$median_p
     batch_median_p_sesame <- batch_sesame_post$median_p
@@ -1964,8 +1970,16 @@ shared_probe_keys <- function(lhs, rhs) {
   merge(lhs_keys, rhs_keys, by = key_cols, all = FALSE, sort = FALSE)
 }
 
-filter_significant <- function(res, fdr, delta_thresh) {
-  res[adj.P.Val <= fdr & abs(delta_beta) >= delta_thresh]
+filter_significant <- function(res, fdr, delta_thresh, p_thresh = 1) {
+  dt <- as.data.table(res)
+  if (!"adj.P.Val" %in% names(dt) || !"delta_beta" %in% names(dt)) {
+    return(dt[0])
+  }
+  mask <- dt$adj.P.Val <= fdr & abs(dt$delta_beta) >= delta_thresh
+  if (!is.null(p_thresh) && is.finite(p_thresh) && p_thresh < 1 && "P.Value" %in% names(dt)) {
+    mask <- mask & dt$P.Value <= p_thresh
+  }
+  dt[mask]
 }
 
 merge_results <- function(minfi, sesame) {
@@ -4723,8 +4737,8 @@ if (!is.null(model_evaluations) && nrow(model_evaluations) > 0) {
   design_selection_summary$ranking <- model_evaluations_ranked
 }
 
-sig_minfi <- filter_significant(results_minfi, opt$fdr_threshold, opt$delta_beta_threshold)
-sig_sesame <- filter_significant(results_sesame, opt$fdr_threshold, opt$delta_beta_threshold)
+sig_minfi <- filter_significant(results_minfi, opt$fdr_threshold, opt$delta_beta_threshold, opt$p_threshold)
+sig_sesame <- filter_significant(results_sesame, opt$fdr_threshold, opt$delta_beta_threshold, opt$p_threshold)
 
 integrated <- merge_results(sig_minfi, sig_sesame)
 integrated$union <- limit_top_hits(integrated$union, opt$top_n_cpgs)
@@ -5761,11 +5775,32 @@ write_table_widget <- function(data, filename, title, subtitle = NULL, descripti
   }
   use_buttons <- nrow(data) <= 1000
   widget_error <- NULL
+  gene_col_targets <- which(names(data) %in% c("gene_symbols", "GeneSymbol", "GeneSymbol_cgid", "genesymbol_cgid")) - 1L
+  if (length(gene_col_targets) > 0) {
+    column_defs <- list(
+      list(
+        targets = as.integer(gene_col_targets),
+        width = "120px",
+        className = "dt-nowrap",
+        render = JS(
+          "function(data, type, row, meta) {",
+          "  if(type !== 'display') return data;",
+          "  if(data == null) return '';",
+          "  var str = data.toString();",
+          "  if(str.length <= 15) return str;",
+          "  return '<span title=\"' + str + '\">' + str.slice(0, 15) + '…</span>';",
+          "}"
+        )
+      )
+    )
+  } else {
+    column_defs <- NULL
+  }
   dt_args <- list(
     data = as.data.frame(data),
     rownames = FALSE,
     filter = "top",
-    options = list(pageLength = 25, scrollX = TRUE)
+    options = list(pageLength = 25, scrollX = TRUE, columnDefs = column_defs)
   )
   if (use_buttons) {
     dt_args$extensions <- "Buttons"
@@ -6654,6 +6689,7 @@ summary <- list(
   array_type = platform_info$dmr,
   sesame_manifest = sesame_manifest_source,
   fdr_threshold = opt$fdr_threshold,
+  p_threshold = opt$p_threshold,
   delta_beta_threshold = opt$delta_beta_threshold,
   groups = as.list(group_counts),
   group_reference = if (!is.null(group_reference) && !is.na(group_reference)) group_reference else NA_character_,
