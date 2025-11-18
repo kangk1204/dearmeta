@@ -5068,6 +5068,10 @@ build_volcano_plotly <- function(results, title, fdr_threshold = opt$fdr_thresho
 }
 
 write_volcano_plotly <- function(results, title, filename) {
+  if (is.null(results) || nrow(results) == 0) {
+    log_message("Fallback interactive volcano for %s skipped: no finite data", title)
+    return(NULL)
+  }
   widget <- build_volcano_plotly(results, title, opt$fdr_threshold)
   if (is.null(widget)) {
     log_message("Fallback interactive volcano for %s skipped: no finite data", title)
