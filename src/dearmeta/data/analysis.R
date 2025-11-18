@@ -14,6 +14,7 @@ suppressPackageStartupMessages({
   library(DMRcate)
   library(ggplot2)
   library(ggrepel)
+  library(gprofiler2)
   library(plotly)
   library(htmlwidgets)
   library(htmltools)
@@ -752,7 +753,12 @@ construct_design <- function(groups, numeric_covars, factor_covars, data, surrog
     df[[col]] <- as.numeric(data[[col]])
   }
   for (col in factor_covars) {
-    df[[col]] <- safe_factor(data[[col]])
+    levels_non_na <- unique(na.omit(as.character(data[[col]])))
+    if (length(levels_non_na) < 2) {
+      log_message("Skipping factor covariate %s: fewer than two non-missing levels.", col)
+      next
+    }
+    df[[col]] <- factor(data[[col]], levels = levels_non_na)
   }
   if (!is.null(surrogate)) {
     df <- cbind(df, surrogate)
@@ -2360,6 +2366,62 @@ interactive_output_metadata <- function(key) {
       description = "Spot reproducible genomic hotspots with consistent differential methylation.",
       category = "Genomic Context",
       icon = "GX"
+    ),
+    overlap_minfi_sesame = list(
+      title = "Overlap · minfi vs sesame",
+      subtitle = "Shared and pipeline-specific CpGs across differential results.",
+      description = "Inspect the balance between unique and shared CpGs across pipelines.",
+      category = "Differential Analysis",
+      icon = "OV"
+    ),
+    context_island = list(
+      title = "CpG island context",
+      subtitle = "Distribution of significant CpGs across CpG island annotations.",
+      description = "Compare island/shore/shelf/open sea distribution across pipelines.",
+      category = "Genomic Context",
+      icon = "GX"
+    ),
+    context_gene = list(
+      title = "Gene region context",
+      subtitle = "Promoter/intron/UTR distribution of significant CpGs.",
+      description = "See where CpGs land relative to gene models for each pipeline.",
+      category = "Genomic Context",
+      icon = "GX"
+    ),
+    cell_composition = list(
+      title = "Cell composition (blood)",
+      subtitle = "Estimated blood cell fractions per sample (minfi reference).",
+      description = "Stacked fractions for each sample; facets by dear_group when available.",
+      category = "Quality Control",
+      icon = "QC"
+    ),
+    enrichment_minfi = list(
+      title = "Enrichment · minfi",
+      subtitle = "GO/KEGG terms enriched among significant CpGs (minfi).",
+      description = "Filter and export enriched terms with FDR control.",
+      category = "Enrichment",
+      icon = "EN"
+    ),
+    enrichment_sesame = list(
+      title = "Enrichment · sesame",
+      subtitle = "GO/KEGG terms enriched among significant CpGs (sesame).",
+      description = "Interactive table of enriched terms specific to the sesame pipeline.",
+      category = "Enrichment",
+      icon = "EN"
+    ),
+    enrichment_intersection = list(
+      title = "Enrichment · intersection",
+      subtitle = "GO/KEGG terms shared across pipelines.",
+      description = "Consistent signals across pipelines with enriched biological themes.",
+      category = "Enrichment",
+      icon = "EN"
+    ),
+    batch_qc = list(
+      title = "Batch QC (pre vs post)",
+      subtitle = "Median PCA association p-values and R² before/after correction.",
+      description = "Confirm batch mitigation by comparing pre/post metrics for each pipeline.",
+      category = "Batch & Covariates",
+      icon = "BC"
     ),
     table_minfi = list(
       title = "Annotated CpGs · minfi",
@@ -5016,6 +5078,266 @@ annotated_shared <- if (nrow(shared_keys) > 0) {
 }
 write_tsv_gz(annotated_shared, file.path(analysis_dir, "annotated_cpg_intersection_dual.tsv.gz"))
 
+# ---- Helper utilities for enhanced outputs ---------------------------------
+
+safe_gene_list <- function(dt, gene_col = "gene_symbols", max_genes = 2000) {
+  if (is.null(dt) || nrow(dt) == 0 || !gene_col %in% names(dt)) {
+    return(character())
+  }
+  vals <- dt[[gene_col]]
+  if (is.null(vals)) {
+    return(character())
+  }
+  genes <- unique(unlist(strsplit(paste(vals, collapse = ";"), "[;,\\s]+")))
+  genes <- trimws(genes)
+  genes <- genes[genes != ""]
+  head(genes, max_genes)
+}
+
+run_enrichment <- function(dt, label, gene_col = "gene_symbols", sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG")) {
+  genes <- safe_gene_list(dt, gene_col)
+  if (length(genes) < 5) {
+    return(list(results = data.table(), message = sprintf("Not enough genes for %s (n=%s)", label, length(genes))))
+  }
+  gost_res <- tryCatch(
+    gprofiler2::gost(
+      query = genes,
+      organism = "hsapiens",
+      sources = sources,
+      user_threshold = 0.05,
+      correction_method = "fdr"
+    ),
+    error = function(e) e
+  )
+  if (inherits(gost_res, "error") || is.null(gost_res$result) || nrow(gost_res$result) == 0) {
+    msg <- if (inherits(gost_res, "error")) conditionMessage(gost_res) else "No enrichment terms returned"
+    return(list(results = data.table(), message = sprintf("%s enrichment unavailable: %s", label, msg)))
+  }
+  enr <- as.data.table(gost_res$result)
+  enr[, neg_log10_p := -log10(p_value)]
+  enr[, label := label]
+  list(results = enr, message = NULL)
+}
+
+enrichment_bar_plot <- function(enr, title, top_n = 10) {
+  if (is.null(enr) || nrow(enr) == 0) {
+    return(ggplot() + theme_void() + labs(title = paste(title, "(no enrichment)")))
+  }
+  top <- enr[order(p_value)][1:min(top_n, nrow(enr))]
+  top[, term_label := sprintf("%s · %s", source, term_name)]
+  top[, term_label := factor(term_label, levels = rev(unique(term_label)))]
+  ggplot(top, aes(x = term_label, y = neg_log10_p, fill = source)) +
+    geom_col(width = 0.7) +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = title, x = NULL, y = "-log10(p-value)", fill = "Source")
+}
+
+overlap_count_table <- function(sig_minfi, sig_sesame) {
+  minfi_set <- unique(sig_minfi$probe_id %||% character())
+  sesame_set <- unique(sig_sesame$probe_id %||% character())
+  data.table(
+    membership = c("minfi_only", "both", "sesame_only"),
+    count = c(
+      length(setdiff(minfi_set, sesame_set)),
+      length(intersect(minfi_set, sesame_set)),
+      length(setdiff(sesame_set, minfi_set))
+    )
+  )
+}
+
+overlap_bar_plot <- function(counts, title) {
+  if (is.null(counts) || nrow(counts) == 0 || sum(counts$count, na.rm = TRUE) == 0) {
+    return(ggplot() + theme_void() + labs(title = paste(title, "(no overlap data)")))
+  }
+  counts[, membership := factor(membership, levels = c("minfi_only", "both", "sesame_only"))]
+  labels <- c(minfi_only = "Unique to minfi", both = "Intersection", sesame_only = "Unique to sesame")
+  ggplot(counts, aes(x = membership, y = count, fill = membership)) +
+    geom_col(width = 0.65) +
+    scale_fill_manual(values = c(minfi_only = "#3b8bba", both = "#6a4c93", sesame_only = "#e24a33"), labels = labels, guide = FALSE) +
+    theme_minimal() +
+    scale_x_discrete(labels = labels) +
+    labs(title = title, x = NULL, y = "CpG count")
+}
+
+build_overlap_plotly <- function(counts, title) {
+  if (is.null(counts) || nrow(counts) == 0 || sum(counts$count, na.rm = TRUE) == 0) {
+    return(NULL)
+  }
+  labels <- c(minfi_only = "Unique to minfi", both = "Intersection", sesame_only = "Unique to sesame")
+  counts[, label := labels[as.character(membership)]]
+  plotly::plot_ly(
+    counts,
+    x = ~label,
+    y = ~count,
+    type = "bar",
+    marker = list(color = c("#3b8bba", "#6a4c93", "#e24a33"))
+  ) %>%
+    plotly::layout(
+      title = title,
+      xaxis = list(title = ""),
+      yaxis = list(title = "CpG count"),
+      bargap = 0.2
+    )
+}
+
+context_count_table <- function(dt, source_label, column) {
+  if (is.null(dt) || nrow(dt) == 0 || !column %in% names(dt)) {
+    return(data.table())
+  }
+  vals <- dt[[column]]
+  vals <- vals[!is.na(vals) & vals != ""]
+  if (length(vals) == 0) {
+    return(data.table())
+  }
+  res <- data.table(context = vals)[, .N, by = context]
+  res[, source := source_label]
+  res
+}
+
+context_bar_plot <- function(counts, title, fill_label = "Context") {
+  if (is.null(counts) || nrow(counts) == 0) {
+    return(ggplot() + theme_void() + labs(title = paste(title, "(no data)")))
+  }
+  counts[, context := factor(context, levels = rev(unique(counts[order(N)]$context)))]
+  ggplot(counts, aes(x = context, y = N, fill = source)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = title, x = fill_label, y = "Count", fill = "Source")
+}
+
+context_plotly <- function(counts, title, fill_label = "Context") {
+  if (is.null(counts) || nrow(counts) == 0) {
+    return(NULL)
+  }
+  plotly::plot_ly(
+    counts,
+    x = ~N,
+    y = ~context,
+    color = ~source,
+    colors = c("#3b8bba", "#e24a33", "#6a4c93"),
+    type = "bar",
+    orientation = "h"
+  ) %>%
+    plotly::layout(
+      title = title,
+      xaxis = list(title = "Count"),
+      yaxis = list(title = fill_label)
+    )
+}
+
+cell_fraction_long <- function(config_dt, cell_cols) {
+  if (length(cell_cols) == 0) {
+    return(data.table())
+  }
+  keep_cols <- intersect(c("gsm_id", "dear_group", cell_cols), names(config_dt))
+  if (!all(c("gsm_id", "dear_group") %in% keep_cols)) {
+    return(data.table())
+  }
+  dt <- melt(
+    config_dt[, ..keep_cols],
+    id.vars = c("gsm_id", "dear_group"),
+    variable.name = "cell_type",
+    value.name = "fraction"
+  )
+  dt <- dt[is.finite(fraction)]
+  dt[, cell_type := gsub("^cell_", "", cell_type)]
+  dt
+}
+
+cell_fraction_plot <- function(dt, title) {
+  if (is.null(dt) || nrow(dt) == 0) {
+    return(ggplot() + theme_void() + labs(title = paste(title, "(no cell fractions)")))
+  }
+  dt[, gsm_id := factor(gsm_id, levels = unique(gsm_id))]
+  ggplot(dt, aes(x = gsm_id, y = fraction, fill = cell_type)) +
+    geom_col() +
+    facet_wrap(~dear_group, scales = "free_x", nrow = 1) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    labs(title = title, x = "Sample", y = "Estimated fraction", fill = "Cell type")
+}
+
+cell_fraction_plotly <- function(dt, title) {
+  if (is.null(dt) || nrow(dt) == 0) {
+    return(NULL)
+  }
+  plotly::plot_ly(
+    dt,
+    x = ~gsm_id,
+    y = ~fraction,
+    color = ~cell_type,
+    colors = RColorBrewer::brewer.pal(8, "Set2"),
+    type = "bar"
+  ) %>%
+    plotly::layout(
+      title = title,
+      xaxis = list(title = "Sample"),
+      yaxis = list(title = "Estimated fraction"),
+      barmode = "stack"
+    )
+}
+
+batch_metrics_long <- function(metrics) {
+  entries <- list(
+    list(pipeline = "minfi", stage = "Pre", metrics = metrics$minfi_pre),
+    list(pipeline = "minfi", stage = "Post", metrics = metrics$minfi_post),
+    list(pipeline = "sesame", stage = "Pre", metrics = metrics$sesame_pre),
+    list(pipeline = "sesame", stage = "Post", metrics = metrics$sesame_post)
+  )
+  dt <- rbindlist(lapply(entries, function(item) {
+    m <- item$metrics
+    if (is.null(m) || (is.na(m$median_p) && is.na(m$median_r2))) {
+      return(NULL)
+    }
+    data.table(
+      pipeline = item$pipeline,
+      stage = item$stage,
+      median_p = m$median_p,
+      median_r2 = m$median_r2
+    )
+  }), fill = TRUE)
+  dt
+}
+
+batch_qc_plot <- function(dt, title) {
+  if (is.null(dt) || nrow(dt) == 0) {
+    return(ggplot() + theme_void() + labs(title = paste(title, "(no batch metrics)")))
+  }
+  dt_long <- melt(dt, id.vars = c("pipeline", "stage"), variable.name = "metric", value.name = "value")
+  dt_long <- dt_long[is.finite(value)]
+  ggplot(dt_long, aes(x = stage, y = value, fill = pipeline)) +
+    geom_col(position = position_dodge(width = 0.6), width = 0.55) +
+    facet_wrap(~metric, scales = "free_y") +
+    theme_minimal() +
+    labs(title = title, x = "Stage", y = "Value", fill = "Pipeline")
+}
+
+batch_qc_plotly <- function(dt, title) {
+  if (is.null(dt) || nrow(dt) == 0) {
+    return(NULL)
+  }
+  dt_long <- melt(dt, id.vars = c("pipeline", "stage"), variable.name = "metric", value.name = "value")
+  dt_long <- dt_long[is.finite(value)]
+  dt_long[, x := paste(metric, stage, sep = ": ")]
+  plotly::plot_ly(
+    dt_long,
+    x = ~x,
+    y = ~value,
+    color = ~pipeline,
+    colors = c(minfi = "#3b8bba", sesame = "#e24a33"),
+    type = "bar"
+  ) %>%
+    plotly::layout(
+      title = title,
+      xaxis = list(title = "Metric · Stage"),
+      yaxis = list(title = "Value"),
+      barmode = "group",
+      legend = list(orientation = "h")
+    )
+}
+
 # ---- Figures (static) -------------------------------------------------------
 
 log_message("Generating static plots...")
@@ -5683,6 +6005,69 @@ qq_plot <- function(res, title) {
 write_plot(qq_plot(results_minfi, "QQ minfi"), file.path(fig_dir, "qq_minfi"))
 write_plot(qq_plot(results_sesame, "QQ sesame"), file.path(fig_dir, "qq_sesame"))
 
+overlap_counts <- overlap_count_table(sig_minfi, sig_sesame)
+write_plot(overlap_bar_plot(overlap_counts, "Overlap summary (minfi vs sesame)"), file.path(fig_dir, "overlap_minfi_sesame"))
+
+sig_annotated_minfi <- if (nrow(sig_minfi) > 0) annotated_minfi[probe_id %chin% sig_minfi$probe_id] else data.table()
+sig_annotated_sesame <- if (nrow(sig_sesame) > 0) annotated_sesame[probe_id %chin% sig_sesame$probe_id] else data.table()
+sig_annotated_intersection <- if (nrow(integrated$intersection) > 0) annotated_intersection[probe_id %chin% integrated$intersection$probe_id] else data.table()
+
+context_island_counts <- rbindlist(list(
+  context_count_table(sig_annotated_minfi, "minfi", "relation_to_island"),
+  context_count_table(sig_annotated_sesame, "sesame", "relation_to_island"),
+  context_count_table(sig_annotated_intersection, "intersection", "relation_to_island")
+), fill = TRUE)
+write_plot(context_bar_plot(context_island_counts, "CpG island context"), file.path(fig_dir, "context_island"))
+
+context_region_counts <- rbindlist(list(
+  context_count_table(sig_annotated_minfi, "minfi", "gene_regions"),
+  context_count_table(sig_annotated_sesame, "sesame", "gene_regions"),
+  context_count_table(sig_annotated_intersection, "intersection", "gene_regions")
+), fill = TRUE)
+write_plot(context_bar_plot(context_region_counts, "Gene region context"), file.path(fig_dir, "context_gene"))
+
+cell_fraction_dt <- cell_fraction_long(config, cell_fraction_columns)
+if (nrow(cell_fraction_dt) > 0) {
+  write_plot(cell_fraction_plot(cell_fraction_dt, "Estimated blood cell composition"), file.path(fig_dir, "cell_composition"))
+} else {
+  log_message("Skipping cell composition plot: no estimated fractions available.")
+}
+
+batch_metrics_plot <- batch_metrics_long(list(
+  minfi_pre = collect_batch_metrics(pca_minfi_pre, candidate_batches),
+  minfi_post = collect_batch_metrics(pca_minfi_post, candidate_batches),
+  sesame_pre = collect_batch_metrics(pca_sesame_pre, candidate_batches),
+  sesame_post = collect_batch_metrics(pca_sesame_post, candidate_batches)
+))
+if (nrow(batch_metrics_plot) > 0) {
+  write_plot(batch_qc_plot(batch_metrics_plot, "Batch effect metrics (pre vs post)"), file.path(fig_dir, "batch_qc"))
+} else {
+  log_message("Skipping batch QC plot: insufficient batch metrics.")
+}
+
+enrichment_minfi <- run_enrichment(sig_annotated_minfi, "minfi")
+enrichment_sesame <- run_enrichment(sig_annotated_sesame, "sesame")
+enrichment_intersection <- run_enrichment(sig_annotated_intersection, "intersection")
+
+if (nrow(enrichment_minfi$results) > 0) {
+  write_tsv_gz(enrichment_minfi$results, file.path(analysis_dir, "enrichment_minfi.tsv.gz"))
+  write_plot(enrichment_bar_plot(enrichment_minfi$results, "Enrichment · minfi"), file.path(fig_dir, "enrichment_minfi"))
+} else if (!is.null(enrichment_minfi$message)) {
+  log_message(enrichment_minfi$message)
+}
+if (nrow(enrichment_sesame$results) > 0) {
+  write_tsv_gz(enrichment_sesame$results, file.path(analysis_dir, "enrichment_sesame.tsv.gz"))
+  write_plot(enrichment_bar_plot(enrichment_sesame$results, "Enrichment · sesame"), file.path(fig_dir, "enrichment_sesame"))
+} else if (!is.null(enrichment_sesame$message)) {
+  log_message(enrichment_sesame$message)
+}
+if (nrow(enrichment_intersection$results) > 0) {
+  write_tsv_gz(enrichment_intersection$results, file.path(analysis_dir, "enrichment_intersection.tsv.gz"))
+  write_plot(enrichment_bar_plot(enrichment_intersection$results, "Enrichment · intersection"), file.path(fig_dir, "enrichment_intersection"))
+} else if (!is.null(enrichment_intersection$message)) {
+  log_message(enrichment_intersection$message)
+}
+
 save_venn <- function(sets, filename_base) {
   venn <- venn.diagram(
     sets,
@@ -5991,6 +6376,117 @@ if (sesame_available && nrow(results_sesame) > 0) {
     if (!is.null(path)) interactive_files$table_sesame <- path
   })
 }
+
+guard_interactive("overlap_minfi_sesame", {
+  meta <- interactive_output_metadata("overlap_minfi_sesame")
+  overlap_widget <- build_overlap_plotly(overlap_counts, "Overlap · minfi vs sesame")
+  if (!is.null(overlap_widget)) {
+    path <- create_interactive(
+      overlap_widget,
+      file.path(interactive_dir, "overlap_minfi_sesame"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$overlap_minfi_sesame <- path
+  }
+})
+
+guard_interactive("context_island", {
+  meta <- interactive_output_metadata("context_island")
+  widget <- context_plotly(context_island_counts, "CpG island context", "Island relation")
+  if (!is.null(widget)) {
+    path <- create_interactive(
+      widget,
+      file.path(interactive_dir, "context_island"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$context_island <- path
+  }
+})
+
+guard_interactive("context_gene", {
+  meta <- interactive_output_metadata("context_gene")
+  widget <- context_plotly(context_region_counts, "Gene region context", "Gene region")
+  if (!is.null(widget)) {
+    path <- create_interactive(
+      widget,
+      file.path(interactive_dir, "context_gene"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$context_gene <- path
+  }
+})
+
+guard_interactive("cell_composition", {
+  meta <- interactive_output_metadata("cell_composition")
+  widget <- cell_fraction_plotly(cell_fraction_dt, "Estimated blood cell composition")
+  if (!is.null(widget)) {
+    path <- create_interactive(
+      widget,
+      file.path(interactive_dir, "cell_composition"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$cell_composition <- path
+  }
+})
+
+guard_interactive("enrichment_minfi", {
+  meta <- interactive_output_metadata("enrichment_minfi")
+  path <- write_table_widget(
+    enrichment_minfi$results,
+    file.path(interactive_dir, "enrichment_minfi"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$enrichment_minfi <- path
+})
+
+guard_interactive("enrichment_sesame", {
+  meta <- interactive_output_metadata("enrichment_sesame")
+  path <- write_table_widget(
+    enrichment_sesame$results,
+    file.path(interactive_dir, "enrichment_sesame"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$enrichment_sesame <- path
+})
+
+guard_interactive("enrichment_intersection", {
+  meta <- interactive_output_metadata("enrichment_intersection")
+  path <- write_table_widget(
+    enrichment_intersection$results,
+    file.path(interactive_dir, "enrichment_intersection"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$enrichment_intersection <- path
+})
+
+guard_interactive("batch_qc", {
+  meta <- interactive_output_metadata("batch_qc")
+  widget <- batch_qc_plotly(batch_metrics_plot, "Batch effect metrics (pre vs post)")
+  if (!is.null(widget)) {
+    path <- create_interactive(
+      widget,
+      file.path(interactive_dir, "batch_qc"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$batch_qc <- path
+  }
+})
 
 # ---- Summary ----------------------------------------------------------------
 
