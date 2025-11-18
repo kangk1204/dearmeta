@@ -372,7 +372,7 @@ ensure_namespace_available <- function(pkg, bioc = TRUE, auto_install_env = "DEA
   if (requireNamespace(pkg, quietly = TRUE)) {
     return(TRUE)
   }
-  auto_install <- tolower(Sys.getenv(auto_install_env, "true")) %in% c("1", "true", "yes", "on")
+  auto_install <- tolower(Sys.getenv(auto_install_env, "false")) %in% c("1", "true", "yes", "on")
   if (!auto_install) {
     return(FALSE)
   }
@@ -693,6 +693,21 @@ make_group_factor <- function(values) {
     f <- factor(f, levels = lvl)
   }
   f
+}
+
+ensure_reference_group_present <- function(group_counts, reference) {
+  if (is.null(reference) || is.na(reference) || !nzchar(reference)) {
+    return(invisible(TRUE))
+  }
+  if (!(reference %in% names(group_counts))) {
+    stop(
+      sprintf(
+        "Specified group_ref '%s' is absent after QC filtering. Update configure.tsv or choose another reference.",
+        reference
+      )
+    )
+  }
+  invisible(TRUE)
 }
 
 build_group_contrast_table <- function(group_levels, group_columns) {
@@ -1153,6 +1168,39 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
     factor_final <- unique(c(params$factor_covars, if (!params$use_combat && !is.null(params$batch_col)) params$batch_col else NULL))
     numeric_final <- unique(params$numeric_covars)
     variables_to_check <- unique(c("dear_group", candidate_batches, numeric_final, factor_final, params$batch_col))
+
+    if (length(factor_final) > 0) {
+      valid_factor <- vapply(
+        factor_final,
+        function(col) {
+          vals <- sanitize_covariate(metadata[[col]])
+          length(unique(na.omit(vals))) >= 2
+        },
+        logical(1)
+      )
+      if (any(!valid_factor)) {
+        dropped <- factor_final[!valid_factor]
+        log_message("Dropping factor covariates with <2 levels after filtering: %s", paste(dropped, collapse = ", "))
+        factor_final <- factor_final[valid_factor]
+      }
+    }
+    if (length(numeric_final) > 0) {
+      valid_numeric <- vapply(
+        numeric_final,
+        function(col) {
+          vals <- metadata[[col]]
+          vals_num <- suppressWarnings(as.numeric(vals))
+          non_missing <- sum(!is.na(vals_num))
+          non_missing >= 2 && length(unique(na.omit(vals_num))) >= 2
+        },
+        logical(1)
+      )
+      if (any(!valid_numeric)) {
+        dropped <- numeric_final[!valid_numeric]
+        log_message("Dropping numeric covariates with insufficient variation after filtering: %s", paste(dropped, collapse = ", "))
+        numeric_final <- numeric_final[valid_numeric]
+      }
+    }
 
     stage <- "baseline_metrics"
     baseline_minfi_candidate <- collect_batch_metrics(data$pca_minfi_pre, candidate_batches)
@@ -1993,6 +2041,186 @@ write_empty_plot <- function(filename, title, message = "Not enough data to rend
   log_message("Wrote placeholder plot %s (no data)", filename)
 }
 
+create_top_cpg_heatmaps <- function(beta_matrix, annotated_results, metadata, fig_dir, interactive_dir, pipeline_label = "minfi", top_n = 100) {
+  outputs <- list(static = list(), interactive = list())
+  if (is.null(beta_matrix) || is.null(annotated_results) || nrow(annotated_results) == 0) {
+    return(outputs)
+  }
+  if (is.null(rownames(beta_matrix)) || is.null(colnames(beta_matrix))) {
+    log_message("Skipping top CpG heatmap: beta matrix lacks row/column names.")
+    return(outputs)
+  }
+  if (!"probe_id" %in% names(annotated_results)) {
+    log_message("Skipping top CpG heatmap: annotated results missing probe_id column.")
+    return(outputs)
+  }
+  metadata_dt <- as.data.table(metadata)
+  sample_ids <- colnames(beta_matrix)
+  gsm_guess <- sub("_.*$", "", sample_ids)
+  sample_meta <- metadata_dt[match(gsm_guess, metadata_dt$gsm_id)]
+  sample_meta$colname <- sample_ids
+  valid_idx <- which(!is.na(sample_meta$dear_group))
+  if (length(valid_idx) == 0) {
+    log_message("Skipping top CpG heatmap: unable to map samples to dear_group.")
+    return(outputs)
+  }
+  sample_ids <- sample_ids[valid_idx]
+  sample_meta <- sample_meta[valid_idx]
+  beta_matrix <- beta_matrix[, valid_idx, drop = FALSE]
+  if (!"comparison" %in% names(annotated_results)) {
+    annotated_results$comparison <- "overall"
+  }
+  comparisons <- unique(annotated_results$comparison)
+  comparisons <- comparisons[!is.na(comparisons) & comparisons != ""]
+  if (length(comparisons) == 0) {
+    comparisons <- "overall"
+  }
+  top_cap <- max(1, as.integer(top_n %||% 100))
+  for (cmp in comparisons) {
+    res_cmp <- if (cmp == "overall") annotated_results else annotated_results[comparison == cmp]
+    if (nrow(res_cmp) == 0) {
+      next
+    }
+    order_metric <- NULL
+    if ("P.Value" %in% names(res_cmp)) {
+      order_metric <- res_cmp$P.Value
+    } else if ("adj.P.Val" %in% names(res_cmp)) {
+      order_metric <- res_cmp$adj.P.Val
+    }
+    if (is.null(order_metric)) {
+      res_cmp <- res_cmp
+    } else {
+      res_cmp <- res_cmp[order(order_metric, na.last = NA)]
+    }
+    probes <- unique(res_cmp$probe_id)
+    probes <- probes[!is.na(probes)]
+    if (length(probes) == 0) {
+      next
+    }
+    top_probes <- head(probes, top_cap)
+    beta_sub <- beta_matrix[top_probes, sample_ids, drop = FALSE]
+    if (!is.matrix(beta_sub)) {
+      beta_sub <- as.matrix(beta_sub)
+    }
+    row_means <- rowMeans(beta_sub, na.rm = TRUE)
+    centered <- sweep(beta_sub, 1, row_means, FUN = "-")
+    row_sds <- apply(centered, 1, sd, na.rm = TRUE)
+    row_sds[!is.finite(row_sds) | row_sds == 0] <- 1
+    z_mat <- sweep(centered, 1, row_sds, FUN = "/")
+    z_mat[!is.finite(z_mat)] <- 0
+    row_labels <- compose_gene_label(
+      res_cmp$gene_symbols[match(top_probes, res_cmp$probe_id)],
+      top_probes
+    )
+    empty_labels <- is.na(row_labels) | row_labels == ""
+    if (any(empty_labels)) {
+      row_labels[empty_labels] <- top_probes[empty_labels]
+    }
+    names(row_labels) <- top_probes
+    row_order <- if (nrow(z_mat) > 1) hclust(dist(z_mat))$order else seq_len(nrow(z_mat))
+    reorder_by_group <- function(values, groups) {
+      ordering <- integer(0)
+      group_levels <- unique(groups)
+      group_levels <- group_levels[!is.na(group_levels)]
+      for (g in group_levels) {
+        idx <- which(groups == g)
+        if (length(idx) > 1) {
+          sub_dist <- tryCatch(dist(t(values[, idx, drop = FALSE])), error = function(...) NULL)
+          if (!is.null(sub_dist) && length(sub_dist) > 0) {
+            ord <- hclust(sub_dist)$order
+            ordering <- c(ordering, idx[ord])
+          } else {
+            ordering <- c(ordering, idx)
+          }
+        } else {
+          ordering <- c(ordering, idx)
+        }
+      }
+      ordering
+    }
+    group_vec <- sample_meta$dear_group
+    col_order <- reorder_by_group(z_mat, group_vec)
+    if (length(col_order) == 0) {
+      col_order <- seq_len(ncol(z_mat))
+    }
+    z_ordered <- z_mat[row_order, col_order, drop = FALSE]
+    row_labels_ordered <- row_labels[row_order]
+    sample_ordered <- sample_ids[col_order]
+    sample_groups <- group_vec[col_order]
+    sample_labels <- paste0(sample_ordered, "\n", sample_groups)
+    label_map <- setNames(sample_labels, sample_ordered)
+    row_factor <- factor(row_labels_ordered, levels = rev(row_labels_ordered))
+    long_df <- as.data.table(z_ordered)
+    setnames(long_df, sample_ordered)
+    long_df[, probe_label := row_labels_ordered]
+    long_df <- melt(long_df, id.vars = "probe_label", variable.name = "sample", value.name = "zscore")
+    long_df[, sample := factor(as.character(sample), levels = sample_ordered)]
+    long_df[, sample_label := factor(label_map[as.character(sample)], levels = sample_labels)]
+    long_df[, probe_label := factor(probe_label, levels = levels(row_factor))]
+    long_df[, group := sample_groups[match(as.character(sample), sample_ordered)]]
+    safe_cmp <- gsub("[^A-Za-z0-9_-]+", "_", cmp)
+    pretty_cmp <- format_identifier_title(cmp)
+    plot_title <- sprintf("Top %s CpGs · %s (%s)", min(top_cap, length(top_probes)), pretty_cmp, pipeline_label)
+    heatmap_plot <- ggplot(long_df, aes(sample_label, probe_label, fill = zscore)) +
+      geom_tile() +
+      scale_fill_gradient2(low = "#2b83ba", mid = "white", high = "#d7191c", midpoint = 0, na.value = "grey90") +
+      labs(
+        title = plot_title,
+        subtitle = "Z-scored corrected beta values; sample axis text includes group.",
+        x = "Samples (group)",
+        y = "CpG (gene label when available)"
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title = element_text(size = 10),
+        legend.position = "right"
+      )
+    static_base <- file.path(fig_dir, paste0("heatmap_top_cpgs_", pipeline_label, "_", safe_cmp))
+    if (write_plot(heatmap_plot, static_base, width = 9, height = 10)) {
+      outputs$static[[paste0("heatmap_top_cpgs_", pipeline_label, "_", safe_cmp)]] <- paste0(static_base, ".png")
+    }
+    hover_matrix <- matrix(
+      paste0(
+        "CpG: ", rep(row_labels_ordered, times = length(sample_ordered)),
+        "<br>Probe: ", rep(top_probes[row_order], times = length(sample_ordered)),
+        "<br>Sample: ", rep(sample_ordered, each = length(row_labels_ordered)),
+        "<br>Group: ", rep(sample_groups, each = length(row_labels_ordered)),
+        "<br>Z-score: ", round(as.numeric(z_ordered), 3)
+      ),
+      nrow = length(row_labels_ordered),
+      ncol = length(sample_ordered)
+    )
+    heatmap_widget <- plotly::plot_ly(
+      x = sample_labels,
+      y = row_labels_ordered,
+      z = z_ordered,
+      type = "heatmap",
+      colors = c("#2b83ba", "white", "#d7191c"),
+      zmid = 0,
+      text = hover_matrix,
+      hoverinfo = "text"
+    ) %>%
+      plotly::layout(
+        title = list(text = plot_title, x = 0),
+        xaxis = list(title = "Samples (group)"),
+        yaxis = list(title = "CpGs / gene", autorange = "reversed")
+      )
+    interactive_path <- create_interactive(
+      heatmap_widget,
+      file.path(interactive_dir, paste0("heatmap_top_cpgs_", pipeline_label, "_", safe_cmp)),
+      title = plot_title,
+      subtitle = "Clustered CpGs with group-labelled samples",
+      description = "Rows/columns clustered; hover for probe, group, and z-scored beta values."
+    )
+    if (!is.null(interactive_path)) {
+      outputs$interactive[[paste0("heatmap_top_cpgs_", pipeline_label, "_", safe_cmp)]] <- interactive_path
+    }
+    log_message("Top CpG heatmap created for %s (%s): %s probes, %s samples", pretty_cmp, pipeline_label, length(top_probes), length(sample_ordered))
+  }
+  outputs
+}
+
 resolve_widget_title <- function(widget) {
   if (inherits(widget, "plotly")) {
     layout_title <- widget$x$layout$title
@@ -2064,6 +2292,17 @@ default_widget_description <- function(widget) {
 }
 
 interactive_output_metadata <- function(key) {
+  if (grepl("^heatmap_top_cpgs", key)) {
+    comparison <- sub("^heatmap_top_cpgs_?", "", key)
+    comparison <- if (!nzchar(comparison) || comparison == key) "Top CpGs" else format_identifier_title(comparison)
+    return(list(
+      title = sprintf("Heatmap · %s", comparison),
+      subtitle = "Top CpGs (z-scored corrected beta values) with gene labels where available.",
+      description = "Columns show samples (group label in axis text); rows are clustered CpGs labelled as gene_probe when annotation exists.",
+      category = "Differential Analysis",
+      icon = "HM"
+    ))
+  }
   switch(
     key,
     pca_pre = list(
@@ -3441,6 +3680,8 @@ if (!is.null(opt$group_ref) && nzchar(trimws(opt$group_ref))) {
   group_reference <- NA_character_
 }
 
+ensure_reference_group_present(group_counts, group_reference)
+
 log_message("Loaded", nrow(config), "samples for analysis across groups:", paste(names(group_counts), group_counts, sep = "=", collapse = "; "))
 
 directives <- attr(config, "directives")
@@ -3529,6 +3770,7 @@ if (length(drop_samples) > 0) {
       paste(names(group_counts[group_counts < opt$min_group_size]), collapse = ", ")
     )
   }
+  ensure_reference_group_present(group_counts, group_reference)
   log_message(
     "Post-QC sample counts: %s",
     paste(names(group_counts), group_counts, sep = "=", collapse = "; ")
@@ -3812,6 +4054,7 @@ if (sesame_available && length(sesame_betas) > 0) {
           paste(names(group_counts[group_counts < opt$min_group_size]), collapse = ", ")
         )
       }
+      ensure_reference_group_present(group_counts, group_reference)
       log_message(
         "Post-sesame QC sample counts: %s",
         paste(names(group_counts), group_counts, sep = "=", collapse = "; ")
@@ -4470,22 +4713,61 @@ run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type
       log_message("Skipping DMRcate for %s (%s): no significant CpGs for this comparison.", pipeline_name, comparison_label)
       next
     }
+    if ((is.null(contrast$contrast_formula) || !is.character(contrast$contrast_formula) || !nzchar(contrast$contrast_formula)) &&
+      (is.null(contrast$coef) || (is.character(contrast$coef) && !nzchar(contrast$coef)) || (is.numeric(contrast$coef) && is.na(contrast$coef)))) {
+      log_message("Skipping DMRcate for %s (%s): contrast lacks coefficient and contrast_formula.", pipeline_name, comparison_label)
+      next
+    }
     log_message("Running DMRcate for %s (%s)", pipeline_name, comparison_label)
-    annotation <- tryCatch(
-      cpg.annotate(
-        object = M_matrix,
-        datatype = "array",
-        what = "M",
-        arraytype = array_type,
-        analysis.type = "differential",
-        design = design,
-        coef = contrast$coef
-      ),
-      error = function(e) {
-        log_message("DMRcate annotation failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
-        NULL
+    annotation <- NULL
+    if (!is.null(contrast$contrast_formula) && is.character(contrast$contrast_formula) && nzchar(contrast$contrast_formula)) {
+      contrast_matrix <- tryCatch(
+        makeContrasts(contrasts = contrast$contrast_formula, levels = design),
+        error = function(e) {
+          log_message(
+            "DMRcate contrast construction failed for %s (%s): %s",
+            pipeline_name,
+            comparison_label,
+            conditionMessage(e)
+          )
+          NULL
+        }
+      )
+      if (!is.null(contrast_matrix)) {
+        annotation <- tryCatch(
+          cpg.annotate(
+            object = M_matrix,
+            datatype = "array",
+            what = "M",
+            arraytype = array_type,
+            analysis.type = "differential",
+            design = design,
+            contrasts = contrast_matrix,
+            coef = 1
+          ),
+          error = function(e) {
+            log_message("DMRcate annotation failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
+            NULL
+          }
+        )
       }
-    )
+    } else {
+      annotation <- tryCatch(
+        cpg.annotate(
+          object = M_matrix,
+          datatype = "array",
+          what = "M",
+          arraytype = array_type,
+          analysis.type = "differential",
+          design = design,
+          coef = contrast$coef
+        ),
+        error = function(e) {
+          log_message("DMRcate annotation failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
+          NULL
+        }
+      )
+    }
     if (is.null(annotation)) {
       next
     }
@@ -5438,6 +5720,47 @@ interactive_dir <- paths$interactive
 
 interactive_files <- list()
 
+heatmap_outputs <- create_top_cpg_heatmaps(
+  beta_matrix = beta_minfi,
+  annotated_results = annotated_minfi,
+  metadata = metadata_dt,
+  fig_dir = fig_dir,
+  interactive_dir = interactive_dir,
+  pipeline_label = "minfi",
+  top_n = min(100, opt$top_n_cpgs %||% 100)
+)
+if (length(heatmap_outputs$interactive) > 0) {
+  interactive_files <- c(interactive_files, heatmap_outputs$interactive)
+}
+
+heatmap_outputs_intersection <- create_top_cpg_heatmaps(
+  beta_matrix = beta_minfi,
+  annotated_results = annotated_intersection,
+  metadata = metadata_dt,
+  fig_dir = fig_dir,
+  interactive_dir = interactive_dir,
+  pipeline_label = "intersection",
+  top_n = min(100, opt$top_n_cpgs %||% 100)
+)
+if (length(heatmap_outputs_intersection$interactive) > 0) {
+  interactive_files <- c(interactive_files, heatmap_outputs_intersection$interactive)
+}
+
+if (sesame_available && !is.null(beta_sesame) && nrow(beta_sesame) > 0) {
+  heatmap_outputs_sesame <- create_top_cpg_heatmaps(
+    beta_matrix = beta_sesame,
+    annotated_results = annotated_sesame,
+    metadata = metadata_dt,
+    fig_dir = fig_dir,
+    interactive_dir = interactive_dir,
+    pipeline_label = "sesame",
+    top_n = min(100, opt$top_n_cpgs %||% 100)
+  )
+  if (length(heatmap_outputs_sesame$interactive) > 0) {
+    interactive_files <- c(interactive_files, heatmap_outputs_sesame$interactive)
+  }
+}
+
 guard_interactive <- function(label, expr) {
   tryCatch(
     force(expr),
@@ -5596,6 +5919,30 @@ guard_interactive("table_minfi", {
   )
   if (!is.null(path)) interactive_files$table_minfi <- path
 })
+guard_interactive("table_intersection", {
+  meta <- interactive_output_metadata("table_intersection")
+  path <- write_table_widget(
+    annotated_intersection,
+    file.path(interactive_dir, "table_intersection"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$table_intersection <- path
+})
+
+guard_interactive("table_intersection_dual", {
+  meta <- interactive_output_metadata("table_intersection_dual")
+  path <- write_table_widget(
+    annotated_shared,
+    file.path(interactive_dir, "table_intersection_dual"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$table_intersection_dual <- path
+})
+
 if (sesame_available && nrow(results_sesame) > 0) {
   guard_interactive("volcano_sesame", {
     meta <- interactive_output_metadata("volcano_sesame")
@@ -5644,29 +5991,6 @@ if (sesame_available && nrow(results_sesame) > 0) {
     if (!is.null(path)) interactive_files$table_sesame <- path
   })
 }
-guard_interactive("table_intersection", {
-  meta <- interactive_output_metadata("table_intersection")
-  path <- write_table_widget(
-    annotated_intersection,
-    file.path(interactive_dir, "table_intersection"),
-    title = meta$title,
-    subtitle = meta$subtitle,
-    description = meta$description
-  )
-  if (!is.null(path)) interactive_files$table_intersection <- path
-})
-
-guard_interactive("table_intersection_dual", {
-  meta <- interactive_output_metadata("table_intersection_dual")
-  path <- write_table_widget(
-    annotated_shared,
-    file.path(interactive_dir, "table_intersection_dual"),
-    title = meta$title,
-    subtitle = meta$subtitle,
-    description = meta$description
-  )
-  if (!is.null(path)) interactive_files$table_intersection_dual <- path
-})
 
 # ---- Summary ----------------------------------------------------------------
 
