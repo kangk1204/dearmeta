@@ -135,11 +135,12 @@ Again, confirm the `renv` library path in the R output.
    ```
    > Need a specific baseline? Append `--group-ref normoweight` (alias `--group_ref`) so limma treats that group as the reference when building contrasts. Otherwise the first `dear_group` in your configure file becomes the default reference.
 5. Reproduce this exact software stack:
-   ```bash
-   python -m pip install -r requirements.lock
-   Rscript -e 'renv::restore(prompt = FALSE)'
-   ```
-   The `requirements.lock` and `renv.lock` files pin every Python and R dependency (including Bioconductor releases) so collaborators can recreate the DearMeta environment bit-for-bit.
+```bash
+python -m pip install -r requirements.lock
+Rscript -e 'renv::restore(prompt = FALSE)'
+```
+   The `requirements.lock` and `renv.lock` files pin every Python and R dependency (including Bioconductor releases) so collaborators can recreate the DearMeta environment bit-for-bit. The R-side `renv/` library is **not** created by pip install; it is created when you run `renv::restore()` (or `bash scripts/bootstrap.sh`).
+6. Optional: enable auto-install of missing R packages by exporting `DEARMETA_AUTO_INSTALL_PACKAGES=1` before running `dearmeta analysis`. Default is off to avoid mutating locked environments.
 
 ### QC controls
 - `--poobah-threshold 0.05` adjusts the sesame pOOBAH failure cutoff (between 0 and 1).
@@ -161,8 +162,8 @@ GSE123456/
 ├── 01_download/        # raw IDAT files, series matrix, metadata
 ├── 02_preprocess/      # preprocessed objects
 ├── 03_analysis/        # analysis outputs
-├── 04_figures/         # static plots
-├── 05_interactive/     # HTML/interactive reports
+├── 04_figures/         # static plots (PCA, volcano, Manhattan, QQ, Venn, top-CpG heatmaps)
+├── 05_interactive/     # HTML/interactive reports (including top-CpG heatmaps)
 └── runtime/            # logs, run_config.json, pipeline artifacts
 ```
 
