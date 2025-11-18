@@ -340,6 +340,9 @@ def analysis(
         None,
         help="Path to the analysis R script. Defaults to the packaged resource.",
     ),
+    fdr_threshold: float = typer.Option(0.05, help="Adjusted p-value (FDR) threshold for significant CpGs."),
+    p_threshold: float = typer.Option(1.0, help="Raw p-value threshold (<=1.0). Use <1 to gate significance further."),
+    delta_beta_threshold: float = typer.Option(0.05, help="Absolute delta-beta threshold for significant CpGs."),
     top_n_cpgs: int = typer.Option(10000, help="Number of CpGs to retain (sorted by p-value) for plots and tables."),
     drop_sesame_failed: bool = typer.Option(
         False, help="Drop samples whose sesame pOOBAH failure rate exceeds the threshold."
@@ -357,6 +360,12 @@ def analysis(
     gse = validate_gse(gse)
     if not (0 < poobah_threshold < 1):
         raise typer.BadParameter("--poobah-threshold must be between 0 and 1")
+    if not (0 < fdr_threshold <= 1):
+        raise typer.BadParameter("--fdr-threshold must be between 0 and 1")
+    if not (0 < p_threshold <= 1):
+        raise typer.BadParameter("--p-threshold must be between 0 and 1")
+    if delta_beta_threshold <= 0:
+        raise typer.BadParameter("--delta-beta-threshold must be positive")
     valid_cell_refs = {"auto", "blood", "none"}
     normalized_cell_ref = cell_comp_reference.strip().lower()
     if normalized_cell_ref not in valid_cell_refs:
@@ -416,6 +425,12 @@ def analysis(
         extra_args = [
             "--top-n-cpgs",
             str(top_n_cpgs),
+            "--fdr-threshold",
+            str(fdr_threshold),
+            "--p-threshold",
+            str(p_threshold),
+            "--delta-beta-threshold",
+            str(delta_beta_threshold),
             "--poobah-threshold",
             str(poobah_threshold),
             "--cell-comp-reference",
