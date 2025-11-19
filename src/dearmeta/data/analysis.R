@@ -54,6 +54,29 @@ if (length(missing_opts) > 0) {
   stop("Missing required arguments: ", paste(missing_opts, collapse = ", "))
 }
 
+ensure_required_packages <- function(pkgs) {
+  missing <- character()
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      missing <- c(missing, pkg)
+    }
+  }
+  if (length(missing) > 0) {
+    stop(
+      sprintf(
+        "Missing R packages: %s. Run `renv::restore()` (or `bash scripts/bootstrap.sh`) to install pinned dependencies.",
+        paste(missing, collapse = ", ")
+      )
+    )
+  }
+}
+
+ensure_required_packages(c(
+  "optparse", "jsonlite", "data.table", "minfi", "sesame", "sesameData", "limma", "sva",
+  "DMRcate", "ggplot2", "ggrepel", "plotly", "htmlwidgets", "DT", "RColorBrewer",
+  "VennDiagram", "gprofiler2"
+))
+
 if (is.null(opt$top_n_cpgs) || length(opt$top_n_cpgs) == 0) {
   opt$top_n_cpgs <- 10000L
 } else {
@@ -5092,6 +5115,7 @@ write_tsv_gz(annotated_shared, file.path(analysis_dir, "annotated_cpg_intersecti
 
 # Determine beta matrix for intersection heatmaps: prefer averaging minfi/sesame on shared probes/samples
 beta_intersection_heatmap <- beta_minfi
+intersection_heatmap_source <- "minfi"
 if (sesame_available && !is.null(beta_sesame) && nrow(beta_sesame) > 0) {
   common_probes <- intersect(rownames(beta_minfi), rownames(beta_sesame))
   common_samples <- intersect(colnames(beta_minfi), colnames(beta_sesame))
@@ -5101,11 +5125,14 @@ if (sesame_available && !is.null(beta_sesame) && nrow(beta_sesame) > 0) {
     if (all(dim(minfi_sub) == dim(sesame_sub))) {
       beta_intersection_heatmap <- (minfi_sub + sesame_sub) / 2
       log_message("Intersection heatmap will use averaged betas across pipelines for %s probes and %s samples.", nrow(beta_intersection_heatmap), ncol(beta_intersection_heatmap))
+      intersection_heatmap_source <- "average_minfi_sesame"
     } else {
       log_message("Intersection heatmap falling back to minfi betas (shared beta dimensions mismatched).")
+      intersection_heatmap_source <- "minfi_fallback_dim_mismatch"
     }
   } else {
     log_message("Intersection heatmap falling back to minfi betas (no shared probes/samples between pipelines).")
+    intersection_heatmap_source <- "minfi_fallback_no_overlap"
   }
 }
 if (!is.null(annotated_intersection) && nrow(annotated_intersection) > 0 && !is.null(beta_intersection_heatmap)) {
@@ -6748,6 +6775,9 @@ summary <- list(
   sva_surrogates = surrogate_count,
   design_selection = design_selection_export,
   top_n_cpgs = opt$top_n_cpgs,
+  heatmap_sources = list(
+    intersection = intersection_heatmap_source
+  ),
   significant_cpgs = list(
     minfi = nrow(sig_minfi),
     sesame = nrow(sig_sesame),
