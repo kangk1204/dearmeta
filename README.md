@@ -123,7 +123,7 @@ Again, confirm the `renv` library path in the R output.
 ## Quick Start
 
 1. Pick a GEO series ID (e.g. `GSE123456`).
-2. Run the download workflow:
+2. Run the download workflow (assumes prerequisites and `requirements.lock`/`renv::restore()` are done):
    ```bash
    dearmeta download --gse GSE123456
    ```
@@ -139,7 +139,7 @@ Again, confirm the `renv` library path in the R output.
    python -m pip install -r requirements.lock
    Rscript -e 'renv::restore(prompt = FALSE)'
    ```
-   The `requirements.lock` and `renv.lock` files pin every Python and R dependency (including Bioconductor releases) so collaborators can recreate the DearMeta environment bit-for-bit. The R-side `renv/` library is **not** created by pip install; it is created when you run `renv::restore()` (or `bash scripts/bootstrap.sh`).
+   The `requirements.lock` and `renv.lock` files pin every Python and R dependency (including Bioconductor releases) so collaborators can recreate the DearMeta environment bit-for-bit. The R-side `renv/` library is **not** created by pip install; it is created when you run `renv::restore()` (or `bash scripts/bootstrap.sh`). **Do not skip this step on a fresh machine.**
 6. Optional: enable auto-install of missing R packages by exporting `DEARMETA_AUTO_INSTALL_PACKAGES=1` before running `dearmeta analysis`. Default is off to avoid mutating locked environments.
 
 ### QC controls
