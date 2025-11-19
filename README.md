@@ -34,6 +34,7 @@ These headers are required for CRAN/Bioconductor packages (`xml2`, `png`, `rhdf5
 - **Ubuntu / WSL** – follow the official CRAN instructions for your Ubuntu release (https://cloud.r-project.org/bin/linux/ubuntu/) to add the CRAN apt repository, then `sudo apt install --no-install-recommends r-base r-base-dev`. This provides `/usr/bin/Rscript` 4.5.1+. Verify with `Rscript --version`.
 - **Conda** – alternatively skip the system-wide install and let Conda provide R by using the environment recipe in step 3 (`conda create -n dearmeta python=3.11 r-base=4.5.1 …`).
 - **Other platforms** – use the CRAN installers/binaries for your OS and note the installation path so it can be referenced via `RSCRIPT=/path/to/Rscript` later if needed.
+  > If `Rscript` still prints “command not found” after these steps, rerun the install command (e.g., `sudo apt install r-base r-base-dev` or `conda install -n dearmeta r-base=4.5.1`) and ensure the R `bin/` directory appears in your `PATH`.
 
 ### 2. Clone the repository
 ```bash
