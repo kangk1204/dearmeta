@@ -75,6 +75,12 @@ Rscript scripts/prime-bioconductor.R
 ```
 This script installs `BiocManager`, pins Bioconductor 3.22, preloads the heavy genomics stack **and caches FlowSorted blood references (EPIC/450k)** so bootstrap runs and blood cell-composition inference do not need to download them later. Inspect the script if you want to reproduce the commands manually.
 > Use `RSCRIPT=/path/to/Rscript Rscript scripts/prime-bioconductor.R` if the desired 4.5.1+ build is not the default on your PATH.
+> If you see `'/usr/local/lib/R/site-library' is not writable`, point `R_LIBS_USER` to a project folder before rerunning so `install.packages()` stays local:
+> ```bash
+> mkdir -p "$PWD/renv/user-library"
+> export R_LIBS_USER="$PWD/renv/user-library"
+> Rscript scripts/prime-bioconductor.R
+> ```
 
 ### 6. Run the bootstrap script
 ```bash
