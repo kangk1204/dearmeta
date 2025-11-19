@@ -2102,14 +2102,12 @@ create_top_cpg_heatmaps <- function(beta_matrix, annotated_results, metadata, fi
       next
     }
     order_metric <- NULL
-    if ("P.Value" %in% names(res_cmp)) {
-      order_metric <- res_cmp$P.Value
-    } else if ("adj.P.Val" %in% names(res_cmp)) {
+    if ("adj.P.Val" %in% names(res_cmp)) {
       order_metric <- res_cmp$adj.P.Val
+    } else if ("P.Value" %in% names(res_cmp)) {
+      order_metric <- res_cmp$P.Value
     }
-    if (is.null(order_metric)) {
-      res_cmp <- res_cmp
-    } else {
+    if (!is.null(order_metric)) {
       res_cmp <- res_cmp[order(order_metric, na.last = NA)]
     }
     probes <- unique(res_cmp$probe_id)
@@ -5092,6 +5090,31 @@ annotated_shared <- if (nrow(shared_keys) > 0) {
 }
 write_tsv_gz(annotated_shared, file.path(analysis_dir, "annotated_cpg_intersection_dual.tsv.gz"))
 
+# Determine beta matrix for intersection heatmaps: prefer averaging minfi/sesame on shared probes/samples
+beta_intersection_heatmap <- beta_minfi
+if (sesame_available && !is.null(beta_sesame) && nrow(beta_sesame) > 0) {
+  common_probes <- intersect(rownames(beta_minfi), rownames(beta_sesame))
+  common_samples <- intersect(colnames(beta_minfi), colnames(beta_sesame))
+  if (length(common_probes) > 0 && length(common_samples) > 0) {
+    minfi_sub <- beta_minfi[common_probes, common_samples, drop = FALSE]
+    sesame_sub <- beta_sesame[common_probes, common_samples, drop = FALSE]
+    if (all(dim(minfi_sub) == dim(sesame_sub))) {
+      beta_intersection_heatmap <- (minfi_sub + sesame_sub) / 2
+      log_message("Intersection heatmap will use averaged betas across pipelines for %s probes and %s samples.", nrow(beta_intersection_heatmap), ncol(beta_intersection_heatmap))
+    } else {
+      log_message("Intersection heatmap falling back to minfi betas (shared beta dimensions mismatched).")
+    }
+  } else {
+    log_message("Intersection heatmap falling back to minfi betas (no shared probes/samples between pipelines).")
+  }
+}
+if (!is.null(annotated_intersection) && nrow(annotated_intersection) > 0 && !is.null(beta_intersection_heatmap)) {
+  keep_idx <- annotated_intersection$probe_id %in% rownames(beta_intersection_heatmap)
+  if (!all(keep_idx)) {
+    annotated_intersection <- annotated_intersection[keep_idx]
+  }
+}
+
 # ---- Helper utilities for enhanced outputs ---------------------------------
 
 safe_gene_list <- function(dt, gene_col = "gene_symbols", max_genes = 2000) {
@@ -6154,7 +6177,7 @@ if (length(heatmap_outputs$interactive) > 0) {
 }
 
 heatmap_outputs_intersection <- create_top_cpg_heatmaps(
-  beta_matrix = beta_minfi,
+  beta_matrix = beta_intersection_heatmap,
   annotated_results = annotated_intersection,
   metadata = metadata_dt,
   fig_dir = fig_dir,

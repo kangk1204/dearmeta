@@ -60,10 +60,12 @@ def run_r_analysis(
     run_env = os.environ.copy()
     if env:
         run_env.update(env)
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    run_env.setdefault("RENV_PROJECT", str(repo_root))
 
     process = subprocess.Popen(
         cmd,
-        cwd=str(project_root),
+        cwd=str(repo_root),
         env=run_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

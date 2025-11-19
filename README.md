@@ -135,10 +135,10 @@ Again, confirm the `renv` library path in the R output.
    ```
    > Need a specific baseline? Append `--group-ref normoweight` (alias `--group_ref`) so limma treats that group as the reference when building contrasts. Otherwise the first `dear_group` in your configure file becomes the default reference.
 5. Reproduce this exact software stack:
-```bash
-python -m pip install -r requirements.lock
-Rscript -e 'renv::restore(prompt = FALSE)'
-```
+   ```bash
+   python -m pip install -r requirements.lock
+   Rscript -e 'renv::restore(prompt = FALSE)'
+   ```
    The `requirements.lock` and `renv.lock` files pin every Python and R dependency (including Bioconductor releases) so collaborators can recreate the DearMeta environment bit-for-bit. The R-side `renv/` library is **not** created by pip install; it is created when you run `renv::restore()` (or `bash scripts/bootstrap.sh`).
 6. Optional: enable auto-install of missing R packages by exporting `DEARMETA_AUTO_INSTALL_PACKAGES=1` before running `dearmeta analysis`. Default is off to avoid mutating locked environments.
 
@@ -162,8 +162,8 @@ GSE123456/
 ├── 01_download/        # raw IDAT files, series matrix, metadata
 ├── 02_preprocess/      # preprocessed objects
 ├── 03_analysis/        # analysis outputs
-├── 04_figures/         # static plots (PCA, volcano, Manhattan, QQ, Venn, top-CpG heatmaps)
-├── 05_interactive/     # HTML/interactive reports (including top-CpG heatmaps)
+├── 04_figures/         # static plots (PCA, volcano, Manhattan, QQ, Venn, top-CpG heatmaps for minfi/intersection/sesame)
+├── 05_interactive/     # HTML/interactive reports (including top-CpG heatmaps for minfi/intersection/sesame)
 └── runtime/            # logs, run_config.json, pipeline artifacts
 ```
 
@@ -182,6 +182,11 @@ GSE123456/
 - **libpng / zlib link errors:** When CRAN's `png` package fails with `cannot find -lz`, install the matching Conda libraries inside the active env (`conda install -c conda-forge zlib libpng xz`) so `R CMD INSTALL` can link against them.
 - **libxml2 / XML package errors:** `scripts/bootstrap.sh` automatically points `XML_CONFIG` at `/usr/bin/xml2-config` and exports the required include/library paths when it exists. If you are on a non-Debian system, set `XML_CONFIG` to your system `xml2-config` path before running the script so CRAN's `XML`/`xml2` packages can link successfully.
 - **Bioconductor version drift:** When Bioconductor only ships a newer release of a pinned package (e.g., `sesameData` or `FlowSorted.*`), the bootstrap script logs a warning and keeps the newer build because it is ≥ the lockfile version.
+- **Manual smoke test:** To run an opt-in end-to-end check, set `GSE_ID` and run `scripts/e2e_smoke.sh`. Example:
+  ```bash
+  GSE_ID=GSE242427 ./scripts/e2e_smoke.sh
+  ```
+  The script will download, remind you to fill `configure.tsv`, and run `dearmeta analysis`. It does not run by default to avoid accidental large downloads.
 
 ## Development Notes
 - Core Python sources live in `src/dearmeta/`.
