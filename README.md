@@ -54,19 +54,28 @@ cd dearmeta
   ```
   > With a plain virtualenv you must have R ≥4.5 installed separately (CRAN Ubuntu repo on Linux, CRAN installer on macOS) and ensure `Rscript` points to that build.
 
-### 4. Prime Bioconductor (optional but speeds up installs)
+### 4. Pin renv library location (prevents installs into user/conda libraries)
+Run these in the repository root **before any R installs**:
+```bash
+export RENV_PROJECT=$PWD
+export RENV_PATHS_LIBRARY=$PWD/renv/library
+export RENV_CONFIG_USER_LIBRARY=FALSE
+unset R_LIBS_USER  # optional; clears user-level overrides
+```
+
+### 5. Prime Bioconductor (optional but speeds up installs)
 ```bash
 Rscript scripts/prime-bioconductor.R
 ```
 This script installs `BiocManager`, pins Bioconductor 3.22, preloads the heavy genomics stack **and caches FlowSorted blood references (EPIC/450k)** so bootstrap runs and blood cell-composition inference do not need to download them later. Inspect the script if you want to reproduce the commands manually.
 
-### 5. Run the bootstrap script
+### 6. Run the bootstrap script
 ```bash
 bash scripts/bootstrap.sh
 ```
 It performs `pip install -r requirements.lock`, `renv::restore()`, and `Rscript scripts/install.R` in one go. The script verifies that your `Rscript` is new enough; override it via `RSCRIPT=/path/to/Rscript` if you maintain multiple R builds.
 
-### 6. Verify
+### 7. Verify
 ```bash
 dearmeta --help
 Rscript -e "sessionInfo()"
@@ -140,6 +149,13 @@ Again, confirm the `renv` library path in the R output.
    Rscript -e 'renv::restore(prompt = FALSE)'
    ```
    The `requirements.lock` and `renv.lock` files pin every Python and R dependency (including Bioconductor releases) so collaborators can recreate the DearMeta environment bit-for-bit. The R-side `renv/` library is **not** created by pip install; it is created when you run `renv::restore()` (or `bash scripts/bootstrap.sh`). **Do not skip this step on a fresh machine.**
+   If R tries to install into user/conda libraries, pin paths first:
+   ```bash
+   export RENV_PROJECT=$PWD
+   export RENV_PATHS_LIBRARY=$PWD/renv/library
+   export RENV_CONFIG_USER_LIBRARY=FALSE
+   unset R_LIBS_USER
+   ```
 6. Optional: enable auto-install of missing R packages by exporting `DEARMETA_AUTO_INSTALL_PACKAGES=1` before running `dearmeta analysis`. Default is off to avoid mutating locked environments.
 
 ### QC controls
