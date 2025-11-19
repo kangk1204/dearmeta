@@ -22,13 +22,18 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
 
 ## Ubuntu / Windows (WSL) Installation
 
-### 1. System packages
+### 1. System packages + R 4.5.1
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-dev \
   libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
 ```
 These headers are required for CRAN/Bioconductor packages (`xml2`, `png`, `rhdf5`, `Rsamtools`, …). Run the same commands inside Ubuntu WSL if you are on Windows.
+
+> **Mandatory:** Install R 4.5.1 (or newer) before continuing. Steps 5–7 call `Rscript` and will fail immediately if it is missing or too old.
+- **Ubuntu / WSL** – follow the official CRAN instructions for your Ubuntu release (https://cloud.r-project.org/bin/linux/ubuntu/) to add the CRAN apt repository, then `sudo apt install --no-install-recommends r-base r-base-dev`. This provides `/usr/bin/Rscript` 4.5.1+. Verify with `Rscript --version`.
+- **Conda** – alternatively skip the system-wide install and let Conda provide R by using the environment recipe in step 3 (`conda create -n dearmeta python=3.11 r-base=4.5.1 …`).
+- **Other platforms** – use the CRAN installers/binaries for your OS and note the installation path so it can be referenced via `RSCRIPT=/path/to/Rscript` later if needed.
 
 ### 2. Clone the repository
 ```bash
@@ -68,12 +73,13 @@ unset R_LIBS_USER  # optional; clears user-level overrides
 Rscript scripts/prime-bioconductor.R
 ```
 This script installs `BiocManager`, pins Bioconductor 3.22, preloads the heavy genomics stack **and caches FlowSorted blood references (EPIC/450k)** so bootstrap runs and blood cell-composition inference do not need to download them later. Inspect the script if you want to reproduce the commands manually.
+> Use `RSCRIPT=/path/to/Rscript Rscript scripts/prime-bioconductor.R` if the desired 4.5.1+ build is not the default on your PATH.
 
 ### 6. Run the bootstrap script
 ```bash
 bash scripts/bootstrap.sh
 ```
-It performs `pip install -r requirements.lock`, `renv::restore()`, and `Rscript scripts/install.R` in one go. The script verifies that your `Rscript` is new enough; override it via `RSCRIPT=/path/to/Rscript` if you maintain multiple R builds.
+It performs `pip install -r requirements.lock`, `renv::restore()`, and `Rscript scripts/install.R` in one go. The script requires `Rscript` 4.5.1+; point to a non-default binary with `RSCRIPT=/path/to/Rscript bash scripts/bootstrap.sh`. (If you already ran the pip install in step 3, bootstrap will rerun it to ensure the versions match the lockfile.)
 
 ### 7. Verify
 ```bash
@@ -98,7 +104,7 @@ source ~/.zprofile
 ```
 
 ### 2. Install R 4.5+
-Download the Apple Silicon `.pkg` from CRAN and install it. R 4.5 is recommended; the bootstrap script can fall back to 4.4/Bioc 3.20 only if unavoidable.
+Download the Apple Silicon `.pkg` from CRAN and install it. R 4.5.1 (or newer) is required because the bootstrap script enforces the version recorded in `renv.lock`.
 
 ### 3. Create a virtual environment
 ```bash
