@@ -22,10 +22,13 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
 
 ## Quick Install (Linux / WSL / macOS)
 
+> **Important:** Always run DearMeta in an isolated Python (venv or Conda). System Python on modern Ubuntu/WSL uses PEP 668 and will block `pip install` in the base environment and can pollute OS packages.
+
 1. Install system build tools (run on Ubuntu/WSL or adjust for your OS):
    ```bash
    sudo apt-get update
-   sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-dev \
+   sudo apt-get install -y build-essential python3-venv python3-pip \
+     libcurl4-openssl-dev libxml2-dev libssl-dev \
      libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
    ```
    On macOS install Xcode CLT + `brew install python@3.11 libxml2 curl openssl`.
@@ -34,19 +37,25 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
    git clone https://github.com/kangk1204/dearmeta.git
    cd dearmeta
    ```
-3. (Important) Force R to use the project `renv` library so nothing spills into user/conda folders:
+3. Create and activate an isolated Python so `pip` is not blocked by system package managers (reactivate this venv before any future DearMeta commands):
+   ```bash
+   python3 -m venv .dearmeta
+   source .dearmeta/bin/activate
+   python -m pip install --upgrade pip
+   ```
+4. (Important) Force R to use the project `renv` library so nothing spills into user/conda folders:
    ```bash
    export RENV_PROJECT=$PWD
    export RENV_PATHS_LIBRARY=$PWD/renv/library
    export RENV_CONFIG_USER_LIBRARY=FALSE
    unset R_LIBS_USER  # optional but avoids surprises
    ```
-4. Let the bootstrap script do *everything* (Python deps + renv restore + R packages):
+5. Let the bootstrap script do *everything* (Python deps + editable CLI install + renv restore + R packages):
    ```bash
    bash scripts/bootstrap.sh
    ```
    Grab a coffee; the first run downloads Bioconductor + sesame data.
-5. Verify:
+6. Verify:
    ```bash
    dearmeta --help
    Rscript -e "sessionInfo()"   # Library paths should point into ./renv/library/...
@@ -61,12 +70,14 @@ That’s it—you now have a reproducible DearMeta install. The detailed section
 ### 1. System packages + R 4.5.1
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-dev \
+sudo apt-get install -y build-essential python3-venv python3-pip \
+  libcurl4-openssl-dev libxml2-dev libssl-dev \
   libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
 ```
 These headers are required for CRAN/Bioconductor packages (`xml2`, `png`, `rhdf5`, `Rsamtools`, …). Run the same commands inside Ubuntu WSL if you are on Windows.
 
 > **Mandatory:** Install R 4.5.1 (or newer) before continuing. Steps 5–7 call `Rscript` and will fail immediately if it is missing or too old.
+> **Also mandatory:** Activate a venv (or Conda env) before running `pip install` or `bash scripts/bootstrap.sh`; base system Python may refuse installs due to PEP 668.
 - **Ubuntu / WSL** – follow the official CRAN instructions for your Ubuntu release (https://cloud.r-project.org/bin/linux/ubuntu/) to add the CRAN apt repository, then `sudo apt install --no-install-recommends r-base r-base-dev`. This provides `/usr/bin/Rscript` 4.5.1+. Verify with `Rscript --version`.
 - **Conda** – alternatively skip the system-wide install and let Conda provide R by using the environment recipe in step 3 (`conda create -n dearmeta python=3.11 r-base=4.5.1 …`).
 - **Other platforms** – use the CRAN installers/binaries for your OS and note the installation path so it can be referenced via `RSCRIPT=/path/to/Rscript` later if needed.
@@ -113,7 +124,7 @@ This script installs `BiocManager`, pins Bioconductor 3.22, preloads the heavy g
 ```bash
 bash scripts/bootstrap.sh
 ```
-It performs `pip install -r requirements.lock`, `renv::restore()`, and `Rscript scripts/install.R` in one go. The script requires `Rscript` 4.5.1+; point to a non-default binary with `RSCRIPT=/path/to/Rscript bash scripts/bootstrap.sh`. (If you already ran the pip install in step 3, bootstrap will rerun it to ensure the versions match the lockfile.)
+It performs `pip install -r requirements.lock`, installs DearMeta in editable mode so `dearmeta` is on PATH, installs the pinned `renv` version, runs `renv::restore()`, and executes `Rscript scripts/install.R` in one go. The script requires `Rscript` 4.5.1+; point to a non-default binary with `RSCRIPT=/path/to/Rscript bash scripts/bootstrap.sh`. (If you already ran the pip install in step 3, bootstrap will rerun it to ensure the versions match the lockfile.)
 
 ### 6. Verify
 ```bash
@@ -140,30 +151,35 @@ source ~/.zprofile
 ### 2. Install R 4.5+
 Download the Apple Silicon `.pkg` from CRAN and install it. R 4.5.1 (or newer) is required because the bootstrap script enforces the version recorded in `renv.lock`.
 
-### 3. Create a virtual environment
+### 3. Clone the repository
+```bash
+git clone https://github.com/kangk1204/dearmeta.git
+cd dearmeta
+```
+
+### 4. Create a virtual environment
 ```bash
 python3 -m venv .dearmeta
 source .dearmeta/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.lock
 ```
+> If you later need a fresh environment, create a new venv (e.g., `.dearmeta2`) and rerun the same commands after activation.
 
-### 4. Export pkg-config hints
+### 5. Export pkg-config hints
 ```bash
 export PKG_CONFIG_PATH="/opt/homebrew/opt/libxml2/lib/pkgconfig:$PKG_CONFIG_PATH"
 ```
 Add this line to `~/.zprofile` if you rebuild frequently.
 
-### 5. Clone + bootstrap
+### 6. Bootstrap
 ```bash
-git clone https://github.com/kangk1204/dearmeta.git
-cd dearmeta
 bash scripts/bootstrap.sh
 ```
 
 > Tip: if you ever see R trying to install into `/usr/lib/R/library` or your conda prefix, export the same `RENV_PROJECT`, `RENV_PATHS_LIBRARY`, `RENV_CONFIG_USER_LIBRARY=FALSE`, and `unset R_LIBS_USER` as shown in the quick install.
 
-### 6. Verify
+### 7. Verify
 Same commands as Ubuntu:
 ```bash
 dearmeta --help
