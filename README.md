@@ -20,6 +20,42 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
 
 ---
 
+## Quick Install (Linux / WSL / macOS)
+
+1. Install system build tools (run on Ubuntu/WSL or adjust for your OS):
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y build-essential libcurl4-openssl-dev libxml2-dev libssl-dev \
+     libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
+   ```
+   On macOS install Xcode CLT + `brew install python@3.11 libxml2 curl openssl`.
+2. Clone this repo and enter it:
+   ```bash
+   git clone https://github.com/kangk1204/dearmeta.git
+   cd dearmeta
+   ```
+3. (Important) Force R to use the project `renv` library so nothing spills into user/conda folders:
+   ```bash
+   export RENV_PROJECT=$PWD
+   export RENV_PATHS_LIBRARY=$PWD/renv/library
+   export RENV_CONFIG_USER_LIBRARY=FALSE
+   unset R_LIBS_USER  # optional but avoids surprises
+   ```
+4. Let the bootstrap script do *everything* (Python deps + renv restore + R packages):
+   ```bash
+   bash scripts/bootstrap.sh
+   ```
+   Grab a coffee; the first run downloads Bioconductor + sesame data.
+5. Verify:
+   ```bash
+   dearmeta --help
+   Rscript -e "sessionInfo()"   # Library paths should point into ./renv/library/...
+   ```
+
+That’s it—you now have a reproducible DearMeta install. The detailed sections below explain each step if you prefer manual control.
+
+---
+
 ## Ubuntu / Windows (WSL) Installation
 
 ### 1. System packages + R 4.5.1
@@ -60,16 +96,7 @@ cd dearmeta
   ```
   > With a plain virtualenv you must have R ≥4.5 installed separately (CRAN Ubuntu repo on Linux, CRAN installer on macOS) and ensure `Rscript` points to that build.
 
-### 4. Pin renv library location (prevents installs into user/conda libraries)
-Run these in the repository root **before any R installs**:
-```bash
-export RENV_PROJECT=$PWD
-export RENV_PATHS_LIBRARY=$PWD/renv/library
-export RENV_CONFIG_USER_LIBRARY=FALSE
-unset R_LIBS_USER  # optional; clears user-level overrides
-```
-
-### 5. Prime Bioconductor (optional but speeds up installs)
+### 4. Prime Bioconductor (optional but speeds up installs)
 ```bash
 Rscript scripts/prime-bioconductor.R
 ```
@@ -82,13 +109,13 @@ This script installs `BiocManager`, pins Bioconductor 3.22, preloads the heavy g
 > Rscript scripts/prime-bioconductor.R
 > ```
 
-### 6. Run the bootstrap script
+### 5. Run the bootstrap script
 ```bash
 bash scripts/bootstrap.sh
 ```
 It performs `pip install -r requirements.lock`, `renv::restore()`, and `Rscript scripts/install.R` in one go. The script requires `Rscript` 4.5.1+; point to a non-default binary with `RSCRIPT=/path/to/Rscript bash scripts/bootstrap.sh`. (If you already ran the pip install in step 3, bootstrap will rerun it to ensure the versions match the lockfile.)
 
-### 7. Verify
+### 6. Verify
 ```bash
 dearmeta --help
 Rscript -e "sessionInfo()"
@@ -133,6 +160,8 @@ git clone https://github.com/kangk1204/dearmeta.git
 cd dearmeta
 bash scripts/bootstrap.sh
 ```
+
+> Tip: if you ever see R trying to install into `/usr/lib/R/library` or your conda prefix, export the same `RENV_PROJECT`, `RENV_PATHS_LIBRARY`, `RENV_CONFIG_USER_LIBRARY=FALSE`, and `unset R_LIBS_USER` as shown in the quick install.
 
 ### 6. Verify
 Same commands as Ubuntu:
