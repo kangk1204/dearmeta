@@ -63,12 +63,13 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
    source .dearmeta/bin/activate
    python -m pip install --upgrade pip
    ```
-4. (Important) Force R to use the project `renv` library so nothing spills into user/conda folders:
+4. (Important) Force R to use the project `renv` library so nothing spills into user/conda folders (and avoids `/usr/local` permission errors):
    ```bash
    export RENV_PROJECT=$PWD
    export RENV_PATHS_LIBRARY=$PWD/renv/library
    export RENV_CONFIG_USER_LIBRARY=FALSE
-   unset R_LIBS_USER  # optional but avoids surprises
+   mkdir -p "$PWD/renv/user-library"
+   export R_LIBS_USER="$PWD/renv/user-library"
    ```
 5. Let the bootstrap script do *everything* (Python deps + editable CLI install + renv restore + R packages):
    ```bash
