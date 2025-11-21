@@ -24,6 +24,26 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
 
 > **Important:** Always run DearMeta in an isolated Python (venv or Conda). System Python on modern Ubuntu/WSL uses PEP 668 and will block `pip install` in the base environment and can pollute OS packages.
 
+0. Install/upgrade R to 4.5.1+ (do this first; bootstrap stops early otherwise):
+   ```bash
+   Rscript --version  # run this; if it shows "command not found" or <4.5.1, follow the install below
+   ```
+   - **Ubuntu / WSL 24.04+ (CRAN repository)**  
+     ```bash
+     sudo apt-get update
+     sudo apt-get install -y --no-install-recommends ca-certificates gnupg
+     sudo mkdir -p /etc/apt/keyrings
+     curl -fsSL https://cloud.r-project.org/bin/linux/ubuntu/marutter_pubkey.asc | sudo tee /etc/apt/keyrings/cran-r.key
+     echo "deb [signed-by=/etc/apt/keyrings/cran-r.key] https://cloud.r-project.org/bin/linux/ubuntu noble-cran40/" | sudo tee /etc/apt/sources.list.d/cran-r.list
+     sudo apt-get update
+     sudo apt-get install -y --no-install-recommends r-base r-base-dev
+     Rscript --version  # should now show 4.5.1+
+     ```
+     Replace `noble` with your Ubuntu codename (`lsb_release -cs`) if different.
+   - **macOS (ARM or Intel)**  
+     Download the matching `.pkg` from https://cloud.r-project.org/bin/macosx/ and install it, then verify with `Rscript --version`. No Homebrew tap is needed for R itself.
+   If you keep multiple R installs, point bootstrap at the correct one: `RSCRIPT=/path/to/Rscript bash scripts/bootstrap.sh`.
+
 1. Install system build tools (run on Ubuntu/WSL or adjust for your OS):
    ```bash
    sudo apt-get update
@@ -251,7 +271,7 @@ GSE123456/
 - **Reusing downloads:** Copy `.dearmeta_cache/` from an existing machine to avoid re-downloading long-lived GEO artifacts.
 - **Verbose logging:** Append `--verbose` to `dearmeta` commands to print debug logs and capture them in `runtime/pipeline.log`.
 - **R package errors:** Ensure the system libraries listed above are installed, then rerun `Rscript scripts/install.R`.
-- **R version mismatch:** `scripts/bootstrap.sh` requires R ≥ the version recorded in `renv.lock` (currently 4.5.1). Install a recent R build or point the script at the right binary via `RSCRIPT=/opt/R/4.5/bin/Rscript bash scripts/bootstrap.sh`.
+- **R version mismatch / `dearmeta: command not found`:** `scripts/bootstrap.sh` exits before installing Python packages when `Rscript` is older than the lockfile (currently 4.5.1), so the CLI never lands on PATH. Install R 4.5.1+ (Ubuntu/WSL 24.04 CRAN apt commands are in the Quick Install section) or rerun with `RSCRIPT=/opt/R/4.5/bin/Rscript bash scripts/bootstrap.sh`.
 - **Bioconductor bootstrap:** If `install.R` complains about missing packages such as `XVector` or `SparseArray`, rerun `Rscript scripts/prime-bioconductor.R` to preinstall the base Bioconductor stack before invoking the bootstrap script again.
 - **libpng / zlib link errors:** When CRAN's `png` package fails with `cannot find -lz`, install the matching Conda libraries inside the active env (`conda install -c conda-forge zlib libpng xz`) so `R CMD INSTALL` can link against them.
 - **libxml2 / XML package errors:** `scripts/bootstrap.sh` automatically points `XML_CONFIG` at `/usr/bin/xml2-config` and exports the required include/library paths when it exists. If you are on a non-Debian system, set `XML_CONFIG` to your system `xml2-config` path before running the script so CRAN's `XML`/`xml2` packages can link successfully.
