@@ -54,6 +54,7 @@ htmlcov/
 .Rhistory
 renv/library/
 renv/staging/
+renv/user-library/
 
 # Editor settings
 .vscode/

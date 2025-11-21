@@ -255,7 +255,15 @@ def download(
         raise typer.BadParameter("Unable to parse any sample metadata from the series matrix.")
     idat_pairs = client.discover_idat_pairs(gse, samples=samples, cache_dir=cache_dir)
     if not idat_pairs:
-        raise typer.BadParameter("No supplementary IDAT pairs were found for this series.")
+        raise typer.BadParameter(
+            (
+                f"No supplementary IDAT pairs were found for {gse}. Possible reasons:\n"
+                f"  1) Series only provides processed matrices\n"
+                f"  2) Files are not in standard IDAT format\n"
+                f"  3) Check the GEO page for raw data links: "
+                f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse}"
+            )
+        )
 
     usable_samples = {gsm: samples[gsm] for gsm in idat_pairs.keys() if gsm in samples}
     dropped = sorted(set(samples.keys()) - set(usable_samples.keys()))

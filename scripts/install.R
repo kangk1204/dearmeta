@@ -117,20 +117,49 @@ ensure_cran(cran_packages)
 bioc_selection <- select_bioc_packages(bioc_package_matrix)
 ensure_bioc(bioc_selection$packages, bioc_selection$version)
 
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# Default ExperimentHub cache under project root if user hasn't set one
+maybe_set_hub_cache <- function() {
+  current <- Sys.getenv("EXPERIMENT_HUB_CACHE", unset = "")
+  if (nzchar(current)) {
+    return(invisible(current))
+  }
+  script_dir <- normalizePath(dirname(sys.frame(1)$ofile %||% "."), winslash = "/", mustWork = FALSE)
+  repo_root <- normalizePath(file.path(script_dir, ".."), winslash = "/", mustWork = FALSE)
+  cache_dir <- file.path(repo_root, ".dearmeta_cache", "ExperimentHub")
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  Sys.setenv(EXPERIMENT_HUB_CACHE = cache_dir)
+  message("EXPERIMENT_HUB_CACHE not set; defaulting to ", cache_dir)
+  invisible(cache_dir)
+}
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+maybe_set_hub_cache()
+
 prefetch_sesame_resources <- function() {
   if (!requireNamespace("sesameData", quietly = TRUE)) {
     message("sesameData package is unavailable; skipping resource prefetch.")
     return(invisible(FALSE))
   }
-  required_titles <- c(
-    "KYCG.EPIC.Mask.20220123",
+  required_titles <- unique(c(
+    # Masks for 450k/EPIC/EPICv2 (950k)
     "KYCG.HM450.Mask.20220123",
+    "KYCG.EPIC.Mask.20220123",
+    "KYCG.EPICv2.Mask",
+    # Address files (fallbacks if missing)
+    "HM450.address",
+    "EPIC.address",
+    "EPICv2.address",
+    # Signature used by sesame
     "idatSignature"
-  )
+  ))
   for (title in required_titles) {
     message("Prefetching sesameData resource: ", title)
     tryCatch(
       {
+        # sesameDataCache writes files into ExperimentHub cache; sesameDataGet loads it
+        invisible(sesameData::sesameDataCache(title))
         invisible(sesameData::sesameDataGet(title))
         message("  cached ", title)
       },

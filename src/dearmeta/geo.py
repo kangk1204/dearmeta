@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import requests
 from pydantic import BaseModel, Field, ConfigDict, validator
 
-from .files import download_file, ensure_dir, gunzip_file, compute_md5
+from .files import download_file, ensure_dir, ensure_subpath, gunzip_file, compute_md5
 from .logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -18,6 +19,8 @@ logger = get_logger(__name__)
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 GEO_FTP_BASE = "https://ftp.ncbi.nlm.nih.gov/geo/series"
 GEO_GPL_BASE = "https://ftp.ncbi.nlm.nih.gov/geo/platforms"
+REQUEST_TIMEOUT = 60
+HEAD_TIMEOUT = 60
 
 IDAT_PATTERN = re.compile(r"/(GSM\d+)[^/]*_(Red|Grn)\.idat(\.gz)?$", re.IGNORECASE)
 MD5_HEX = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
@@ -170,6 +173,7 @@ class GeoClient:
         self.default_params = {"retmode": "json"}
         if email:
             self.default_params["email"] = email
+        api_key = api_key or os.getenv("NCBI_API_KEY") or os.getenv("DEARMETA_NCBI_API_KEY")
         if api_key:
             self.default_params["api_key"] = api_key
 
@@ -240,7 +244,7 @@ class GeoClient:
     def download_series_matrix(self, gse: str, cache_dir: Path, force: bool = False) -> Path:
         """Download and return the path to the series matrix file."""
         cache_dir = ensure_dir(cache_dir)
-        target_dir = ensure_dir(cache_dir / gse)
+        target_dir = ensure_dir(ensure_subpath(cache_dir, cache_dir / gse))
         existing = list(target_dir.glob("*_series_matrix.txt"))
         if existing and not force:
             return existing[0]
@@ -273,7 +277,7 @@ class GeoClient:
         if not candidates:
             raise RuntimeError(f"Could not locate annotation file for {gpl}")
         annot = candidates[0]
-        dest = destination_dir / annot
+        dest = ensure_subpath(destination_dir, destination_dir / annot)
         annot_url = f"{url}{annot}"
         size, expected_md5 = self._fetch_remote_metadata(annot_url)
         download_file(
@@ -286,7 +290,7 @@ class GeoClient:
 
     def download_idat_pair(self, pair: IdatPair, dest_root: Path) -> IdatPair:
         """Download an IDAT pair for a GSM into ``dest_root``."""
-        target_dir = ensure_dir(dest_root / pair.gsm)
+        target_dir = ensure_dir(ensure_subpath(dest_root, dest_root / pair.gsm))
         red_path = target_dir / Path(pair.red).name
         green_path = target_dir / Path(pair.green).name
         reused_red, md5_red = _reuse_existing_idat(red_path)
@@ -326,7 +330,7 @@ class GeoClient:
     # --- Internal helpers ---------------------------------------------------
     def _esearch_series(self, gse: str) -> str:
         params = {**self.default_params, "db": "gds", "term": f"{gse}[Accession]"}
-        response = self.session.get(f"{EUTILS_BASE}/esearch.fcgi", params=params, timeout=30)
+        response = self.session.get(f"{EUTILS_BASE}/esearch.fcgi", params=params, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         payload = response.json()
         ids = payload.get("esearchresult", {}).get("idlist", [])
@@ -336,7 +340,7 @@ class GeoClient:
 
     def _esummary(self, gds_id: str) -> dict:
         params = {**self.default_params, "db": "gds", "id": gds_id}
-        response = self.session.get(f"{EUTILS_BASE}/esummary.fcgi", params=params, timeout=30)
+        response = self.session.get(f"{EUTILS_BASE}/esummary.fcgi", params=params, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         payload = response.json()
         return payload["result"][gds_id]
@@ -346,7 +350,7 @@ class GeoClient:
         for platform_id in platform_ids:
             try:
                 params = {**self.default_params, "db": "gds", "id": platform_id}
-                response = self.session.get(f"{EUTILS_BASE}/esummary.fcgi", params=params, timeout=30)
+                response = self.session.get(f"{EUTILS_BASE}/esummary.fcgi", params=params, timeout=REQUEST_TIMEOUT)
                 response.raise_for_status()
                 payload = response.json()
                 summary = payload["result"].get(platform_id)
@@ -364,7 +368,7 @@ class GeoClient:
         return [f"{url}{name}" for name in files]
 
     def _list_remote_files(self, url: str) -> List[str]:
-        response = self.session.get(url, timeout=30)
+        response = self.session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         hrefs = re.findall(r'href="([^"]+)"', response.text)
         # remove parent directory references
@@ -380,7 +384,7 @@ class GeoClient:
     def _fetch_remote_metadata(self, url: str) -> Tuple[Optional[int], Optional[str]]:
         """Return (size_bytes, md5_from_etag) if exposed by the remote server."""
         try:
-            response = self.session.head(url, allow_redirects=True, timeout=30)
+            response = self.session.head(url, allow_redirects=True, timeout=HEAD_TIMEOUT)
             response.raise_for_status()
         except requests.RequestException:
             logger.debug("Metadata lookup failed for %s", url)

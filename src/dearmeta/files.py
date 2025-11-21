@@ -27,6 +27,15 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def ensure_subpath(base: Path, candidate: Path) -> Path:
+    """Ensure ``candidate`` lives under ``base`` to prevent path traversal."""
+    base_resolved = base.resolve(strict=False)
+    candidate_resolved = candidate.resolve(strict=False)
+    if not candidate_resolved.is_relative_to(base_resolved):
+        raise ValueError(f"Refusing to write outside base directory: {candidate}")
+    return candidate
+
+
 def _stream_to_file(response: Response, destination: Path, show_progress: bool = True) -> str:
     """Stream an HTTP response to disk with optional progress bar; return md5 checksum."""
     total = int(response.headers.get("Content-Length", 0))
@@ -57,7 +66,7 @@ def download_file(
     destination: Path,
     retries: int = 4,
     backoff_factor: float = 1.5,
-    timeout: int = 60,
+    timeout: int = 180,
     show_progress: bool = True,
     expected_md5: Optional[str] = None,
     expected_size: Optional[int] = None,
