@@ -70,6 +70,25 @@ def _looks_biological_batch(name: str) -> bool:
     return any(keyword in normalized for keyword in BIOLOGICAL_BATCH_KEYWORDS)
 
 
+IDENTIFIER_LIKE_KEYWORDS = (
+    "id",
+    "barcode",
+    "sentrix",
+    "array",
+    "plate",
+    "chip",
+)
+PROTECTED_IDENTIFIER_COLUMNS = {"sentrix_id", "sentrix_position"}
+
+
+def _should_force_categorical(name: str) -> bool:
+    """Return True for identifier-like columns that should remain strings."""
+    normalized = _normalize_name(name)
+    if normalized in PROTECTED_IDENTIFIER_COLUMNS:
+        return True
+    return any(keyword in normalized for keyword in IDENTIFIER_LIKE_KEYWORDS)
+
+
 def _has_sufficient_batch_support(series: pd.Series, total_len: int) -> bool:
     series = series.dropna()
     if total_len <= 0 or series.empty:
@@ -154,7 +173,8 @@ def infer_column_types(frame: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Li
         non_missing = int(series_clean.notna().sum())
         unique_ratio = series_clean.nunique(dropna=True) / max(non_missing, 1)
         numeric_series = pd.to_numeric(series, errors="coerce")
-        if numeric_series.notna().sum() >= len(series) * 0.6:
+        force_categorical = _should_force_categorical(column)
+        if numeric_series.notna().sum() >= len(series) * 0.6 and not force_categorical:
             frame[column] = numeric_series
             numeric_cols.append(column)
         else:

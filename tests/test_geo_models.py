@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from dearmeta.geo import SeriesMetadata, parse_series_matrix
+from dearmeta.geo import SeriesMetadata, _is_valid_cached_download, parse_series_matrix
+from dearmeta.files import compute_md5
 
 
 def test_series_metadata_infers_platform_and_normalises():
@@ -34,3 +35,13 @@ def test_parse_series_matrix_extracts_samples(tmp_path):
     samples = parse_series_matrix(matrix)
     assert len(samples) == 2
     assert samples[0].characteristics["age"] == "30"
+
+
+def test_validates_cached_download(tmp_path):
+    payload = b"abc123"
+    path = tmp_path / "file.gz"
+    path.write_bytes(payload)
+    expected_md5 = compute_md5(path)
+    assert _is_valid_cached_download(path, len(payload), expected_md5)
+    assert not _is_valid_cached_download(path, len(payload) + 1, expected_md5)
+    assert not _is_valid_cached_download(path, len(payload), "deadbeefdeadbeefdeadbeefdeadbeef")

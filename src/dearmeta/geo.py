@@ -245,10 +245,6 @@ class GeoClient:
         """Download and return the path to the series matrix file."""
         cache_dir = ensure_dir(cache_dir)
         target_dir = ensure_dir(ensure_subpath(cache_dir, cache_dir / gse))
-        existing = list(target_dir.glob("*_series_matrix.txt"))
-        if existing and not force:
-            return existing[0]
-
         matrix_listing = self._list_remote_files(self._matrix_url(gse))
         matrix_candidates = [f for f in matrix_listing if f.endswith("_series_matrix.txt.gz")]
         if not matrix_candidates:
@@ -257,6 +253,14 @@ class GeoClient:
         dest = target_dir / matrix_file
         matrix_url = f"{self._matrix_url(gse)}/{matrix_file}"
         size, expected_md5 = self._fetch_remote_metadata(matrix_url)
+        extracted = dest.with_suffix("") if dest.suffix == ".gz" else dest
+        if not force and _is_valid_cached_download(dest, size, expected_md5):
+            if extracted.exists():
+                return extracted
+            return gunzip_file(dest, remove_original=False)
+        if not force and not dest.exists() and extracted.exists() and expected_md5 is None and size is None:
+            # No remote metadata available; reuse non-empty extracted copy
+            return extracted
         checksum = download_file(
             matrix_url,
             dest,
@@ -264,8 +268,7 @@ class GeoClient:
             expected_size=size,
         )
         logger.info("Downloaded %s (md5=%s)", dest.name, checksum)
-        extracted = gunzip_file(dest, remove_original=False)
-        return extracted
+        return gunzip_file(dest, remove_original=False)
 
     def download_platform_table(self, gpl: str, destination_dir: Path) -> Path:
         """Download GPL table to destination directory."""
@@ -293,28 +296,39 @@ class GeoClient:
         target_dir = ensure_dir(ensure_subpath(dest_root, dest_root / pair.gsm))
         red_path = target_dir / Path(pair.red).name
         green_path = target_dir / Path(pair.green).name
-        reused_red, md5_red = _reuse_existing_idat(red_path)
-        reused_green, md5_green = _reuse_existing_idat(green_path)
         red_meta = self._fetch_remote_metadata(pair.red)
         green_meta = self._fetch_remote_metadata(pair.green)
-        if reused_red:
-            logger.debug("Reusing existing IDAT archive %s", red_path)
-        else:
+        red_extracted = _extracted_path(red_path)
+        green_extracted = _extracted_path(green_path)
+
+        red_valid = _is_valid_cached_download(red_path, red_meta[0], red_meta[1]) and red_extracted.exists()
+        green_valid = _is_valid_cached_download(green_path, green_meta[0], green_meta[1]) and green_extracted.exists()
+
+        md5_red = compute_md5(red_path) if red_valid else None
+        md5_green = compute_md5(green_path) if green_valid else None
+
+        if not red_valid:
+            red_extracted.unlink(missing_ok=True)
             md5_red = download_file(
                 pair.red,
                 red_path,
                 expected_md5=red_meta[1],
                 expected_size=red_meta[0],
             )
-        if reused_green:
-            logger.debug("Reusing existing IDAT archive %s", green_path)
         else:
+            logger.debug("Reusing existing IDAT archive %s", red_path)
+
+        if not green_valid:
+            green_extracted.unlink(missing_ok=True)
             md5_green = download_file(
                 pair.green,
                 green_path,
                 expected_md5=green_meta[1],
                 expected_size=green_meta[0],
             )
+        else:
+            logger.debug("Reusing existing IDAT archive %s", green_path)
+
         extracted_red = gunzip_file(red_path)
         extracted_green = gunzip_file(green_path)
         return IdatPair(
@@ -418,12 +432,28 @@ def _md5_from_etag(etag: Optional[str]) -> Optional[str]:
     return None
 
 
-def _reuse_existing_idat(path: Path) -> Tuple[bool, Optional[str]]:
-    """Return whether a previously downloaded IDAT archive can be reused."""
-    extracted = path.with_suffix("") if path.suffix == ".gz" else path
-    if path.exists() and extracted.exists():
-        return True, compute_md5(path)
-    return False, None
+def _extracted_path(path: Path) -> Path:
+    """Return the path of the extracted file corresponding to a .gz archive."""
+    return path.with_suffix("") if path.suffix == ".gz" else path
+
+
+def _is_valid_cached_download(path: Path, expected_size: Optional[int], expected_md5: Optional[str]) -> bool:
+    """Check whether a cached download matches expected size/checksum."""
+    if not path.exists():
+        return False
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    if expected_size is not None and size != expected_size:
+        return False
+    if expected_md5:
+        actual = compute_md5(path)
+        if actual.lower() != expected_md5.lower():
+            return False
+    return True
 
 
 def _series_group_dir(accession: str) -> str:

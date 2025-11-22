@@ -65,6 +65,8 @@ def test_infer_column_types_and_candidate_batches(sample_inputs):
     assert "age" in numeric
     assert any(col.startswith("array") for col in batches)
     assert clean.shape[0] == 4
+    assert "sentrix_id" not in numeric
+    assert clean["sentrix_id"].iloc[0].startswith("12345678")
 
 
 def test_generate_configure_tsv(tmp_path: Path):

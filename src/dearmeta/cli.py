@@ -442,6 +442,8 @@ def analysis(
             str(p_threshold),
             "--delta-beta-threshold",
             str(delta_beta_threshold),
+            "--min-group-size",
+            str(min_group_size),
             "--poobah-threshold",
             str(poobah_threshold),
             "--cell-comp-reference",

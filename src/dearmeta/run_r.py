@@ -76,6 +76,22 @@ def _resolve_rscript_candidates() -> str:
     return chosen
 
 
+def _detect_renv_project() -> Path:
+    """Determine the most appropriate renv project root."""
+    env_project = os.environ.get("RENV_PROJECT")
+    if env_project:
+        return Path(env_project)
+
+    search_roots = [Path.cwd()]
+    search_roots.extend(Path(__file__).resolve().parents)
+    for root in search_roots:
+        if (root / "renv.lock").exists():
+            return root
+
+    # Fallback to the package root (site-packages or repo /src)
+    return Path(__file__).resolve().parent.parent
+
+
 def run_r_analysis(
     gse: str,
     project_root: Path,
@@ -106,12 +122,12 @@ def run_r_analysis(
     run_env = os.environ.copy()
     if env:
         run_env.update(env)
-    repo_root = Path(__file__).resolve().parent.parent.parent
+    repo_root = _detect_renv_project()
     run_env.setdefault("RENV_PROJECT", str(repo_root))
 
     process = subprocess.Popen(
         cmd,
-        cwd=str(repo_root),
+        cwd=str(repo_root) if repo_root.exists() else None,
         env=run_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
