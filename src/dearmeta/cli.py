@@ -342,7 +342,7 @@ def analysis(
         None,
         "--group-ref",
         "--group_ref",
-        help="Group label to use as the reference (baseline) in limma contrasts.",
+        help="Reference priority list for contrasts (comma-separated, highest priority first).",
     ),
     r_script: Optional[Path] = typer.Option(
         None,
@@ -419,14 +419,17 @@ def analysis(
             raise typer.BadParameter(f"Groups with insufficient sample count: {problematic}")
         normalized_group_ref: Optional[str] = None
         if group_ref is not None:
-            candidate = group_ref.strip()
-            if not candidate:
+            priority = [entry.strip() for entry in group_ref.split(",")]
+            priority = [entry for entry in priority if entry]
+            if not priority:
                 raise typer.BadParameter("--group-ref cannot be empty")
-            if candidate not in group_sizes.index:
-                raise typer.BadParameter(
-                    f"--group-ref '{candidate}' is not present in dear_group. Available groups: {sorted(group_sizes.index.tolist())}"
+            normalized_group_ref = ",".join(priority)
+            missing = [entry for entry in priority if entry not in group_sizes.index]
+            if missing:
+                logger.warning(
+                    "Some --group-ref entries are not present in dear_group and will be ignored if still absent after QC: %s",
+                    ", ".join(sorted(missing)),
                 )
-            normalized_group_ref = candidate
 
         logger.info("Running R analysis for %s with %s samples", gse, retained.shape[0])
         logger.debug("Using R script at %s", script_path)

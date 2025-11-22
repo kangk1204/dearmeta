@@ -18,16 +18,62 @@ class RRuntimeError(RuntimeError):
     """Raised when the R pipeline exits with a non-zero status."""
 
 
-def check_rscript_available(rscript: str = "Rscript") -> str:
-    """Return the Rscript executable path if available, otherwise raise."""
+def _has_bitmap_capabilities(rscript: str) -> bool:
+    """Return True if the given Rscript reports a bitmap device (cairo/png/jpeg)."""
+    try:
+        out = subprocess.check_output(
+            [
+                rscript,
+                "-e",
+                "caps<-capabilities(); cat(any(caps[c('cairo','png','jpeg')]))",
+            ],
+            text=True,
+        )
+        return out.strip().lower() in {"true", "t", "1"}
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Failed to query capabilities from %s: %s", rscript, exc)
+        return False
+
+
+def _resolve_rscript_candidates() -> str:
+    """Pick an Rscript, preferring one with bitmap support for interactive plots."""
     from shutil import which
 
-    resolved = which(rscript)
-    if not resolved:
+    env_rscript = os.environ.get("DEARMETA_RSCRIPT") or os.environ.get("RSCRIPT")
+    candidates = [env_rscript] if env_rscript else []
+    candidates.extend(["Rscript", "/usr/bin/Rscript"])
+
+    seen = set()
+    resolved_candidates = []
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if Path(candidate).is_absolute() or "/" in candidate:
+            path = candidate if Path(candidate).exists() else None
+        else:
+            path = which(candidate)
+        if path:
+            resolved_candidates.append(path)
+
+    if not resolved_candidates:
         raise FileNotFoundError(
-            "Rscript executable not found. Ensure R (>=4.3) is installed or use the Docker workflow."
+            "Rscript executable not found. Ensure R (>=4.3) is installed or set DEARMETA_RSCRIPT=/path/to/Rscript."
         )
-    return resolved
+
+    bitmap_rscript = None
+    for path in resolved_candidates:
+        if _has_bitmap_capabilities(path):
+            bitmap_rscript = path
+            break
+
+    chosen = bitmap_rscript or resolved_candidates[0]
+    logger.info(
+        "Using Rscript at %s (bitmap device: %s)",
+        chosen,
+        "yes" if _has_bitmap_capabilities(chosen) else "no",
+    )
+    return chosen
 
 
 def run_r_analysis(
@@ -40,7 +86,7 @@ def run_r_analysis(
     env: Optional[Dict[str, str]] = None,
 ) -> None:
     """Execute the R analysis script with the required arguments."""
-    rscript_bin = check_rscript_available()
+    rscript_bin = _resolve_rscript_candidates()
     cmd = [
         rscript_bin,
         str(r_script),

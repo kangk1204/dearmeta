@@ -49,7 +49,8 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
    sudo apt-get update
    sudo apt-get install -y build-essential python3-venv python3-pip \
      libcurl4-openssl-dev libxml2-dev libssl-dev \
-     libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
+     libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev \
+     libcairo2-dev
    ```
    On macOS install Xcode CLT + `brew install python@3.11 libxml2 curl openssl`.
 2. Clone this repo and enter it:
@@ -75,7 +76,7 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
    ```bash
    bash scripts/bootstrap.sh
    ```
-   Grab a coffee; the first run downloads Bioconductor + sesame data.
+   Grab a coffee; the first run downloads Bioconductor + sesame data (HM450/EPIC/EPICv2) and tries to install bitmap devices (Cairo/ragg) for interactive plots. If Cairo fails, install `libcairo2-dev libpng-dev libjpeg-dev libtiff-dev` and rerun.
 6. Verify:
    ```bash
    dearmeta --help
@@ -93,7 +94,8 @@ That’s it—you now have a reproducible DearMeta install. The detailed section
 sudo apt-get update
 sudo apt-get install -y build-essential python3-venv python3-pip \
   libcurl4-openssl-dev libxml2-dev libssl-dev \
-  libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
+  libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev \
+  libcairo2-dev
 ```
 These headers are required for CRAN/Bioconductor packages (`xml2`, `png`, `rhdf5`, `Rsamtools`, …). Run the same commands inside Ubuntu WSL if you are on Windows.
 
@@ -264,9 +266,12 @@ GSE123456/
 
 ### Choosing a reference group (`--group-ref`)
 - The `dear_group` column in `configure.tsv` tells DearMeta how samples cluster for differential testing; limma builds contrasts by comparing every group to a *reference* (baseline) group.
-- If you do **not** pass `--group-ref`, the first non-empty `dear_group` value encountered in `configure.tsv` becomes the baseline. This might be arbitrary (e.g., whichever row you listed first).
-- Pin the baseline explicitly with `dearmeta analysis --gse GSE123456 --group-ref control`. The value must match one of the strings already present in `dear_group`, and the CLI will warn if it does not.
-- All volcano plots, top-table exports, and HTML dashboards will then label comparisons as `target_vs_control`, making it clear which direction the log-fold changes represent.
+- `--group-ref` accepts a **comma-separated priority list** (highest priority first) so multi-group designs work as expected. Examples:
+  - `--group-ref Control` → baseline Control, contrasts `Treated_vs_Control`, etc.
+  - `--group-ref Control,MD` with groups Control/MD/AD → contrasts `MD_vs_Control`, `AD_vs_Control`, and `AD_vs_MD` (MD used as reference for the AD vs MD comparison because it is higher priority).
+  - Missing entries are ignored; if nothing matches, DearMeta auto-detects control-like labels (`control`, `vehicle`, `baseline`, …) or falls back to the first group present.
+- If you omit `--group-ref`, the first non-empty `dear_group` value becomes the baseline, which might be arbitrary.
+- All volcano plots, top-table exports, and HTML dashboards label comparisons as `target_vs_reference`, making the direction of log-fold changes explicit.
 
 ## Tips & Troubleshooting
 - **Reusing downloads:** Copy `.dearmeta_cache/` from an existing machine to avoid re-downloading long-lived GEO artifacts.

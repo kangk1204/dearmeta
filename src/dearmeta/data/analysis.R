@@ -24,6 +24,7 @@ suppressPackageStartupMessages({
   library(grid)
 })
 
+options(bitmapType = "cairo")
 set.seed(1234)
 use_alt_repo <- tolower(Sys.getenv("DEARMETA_SESAME_ALT", "false"))
 options(SESAMEDATA_USE_ALT = use_alt_repo %in% c("1", "true", "yes", "on"))
@@ -140,10 +141,12 @@ log_message <- function(...) {
       }
     }, character(1)), collapse = " ")
   }
-  cat(sprintf("[%s] %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg))
+  cat(sprintf("[%s] %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg), file = stdout())
   flush.console()
   log_file <- file.path(paths$runtime, "pipeline.log")
-  cat(sprintf("[%s] %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg), file = log_file, append = TRUE)
+  if (!is.null(log_file) && length(log_file) > 0 && !is.na(log_file) && nzchar(log_file)) {
+    cat(sprintf("[%s] %s\n", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg), file = log_file, append = TRUE)
+  }
 }
 
 `%||%` <- function(x, y) {
@@ -159,7 +162,8 @@ log_message <- function(...) {
   x
 }
 
-group_reference <- NA_character_
+group_reference_priority <- character()
+group_reference_resolved <- NA_character_
 
 DEFAULT_PROTECTED_BATCH <- c("sex", "gender", "sex_at_birth", "biological_sex")
 PROTECTED_BATCH_PATTERNS <- c("sex", "gender")
@@ -706,39 +710,57 @@ safe_factor <- function(x) {
   factor(x, levels = levels)
 }
 
-apply_reference_level <- function(levels_vec, reference) {
-  if (is.null(reference) || is.na(reference) || !(reference %in% levels_vec)) {
-    return(levels_vec)
+resolve_group_levels <- function(values) {
+  values <- as.character(values)
+  values[values == ""] <- NA_character_
+  levels_vec <- unique(na.omit(values))
+  if (length(levels_vec) == 0) {
+    return(list(levels = character(), reference = NA_character_))
   }
-  c(reference, setdiff(levels_vec, reference))
+  priority <- unique(trimws(group_reference_priority))
+  priority <- priority[priority != ""]
+  matched <- priority[priority %in% levels_vec]
+  if (length(matched) == 0) {
+    control_like <- c("control", "ctrl", "vehicle", "baseline", "normal", "healthy", "wt", "wildtype", "untreated", "placebo")
+    norm_levels <- normalize_name(levels_vec)
+    ctrl_match <- levels_vec[norm_levels %in% control_like]
+    if (length(ctrl_match) > 0) {
+      matched <- ctrl_match[1]
+    }
+  }
+  reference <- if (length(matched) > 0) matched[1] else levels_vec[1]
+  remaining_priority <- setdiff(matched, reference)
+  remaining_levels <- setdiff(levels_vec, c(reference, remaining_priority))
+  ordered_levels <- c(reference, remaining_priority, remaining_levels)
+  list(levels = ordered_levels, reference = reference)
 }
 
 make_group_factor <- function(values) {
-  f <- safe_factor(values)
-  if (!is.null(group_reference) && !is.na(group_reference)) {
-    lvl <- levels(f)
-    lvl <- apply_reference_level(lvl, group_reference)
-    f <- factor(f, levels = lvl)
+  resolved <- resolve_group_levels(values)
+  if (!is.null(resolved$reference) && !is.na(resolved$reference)) {
+    group_reference_resolved <<- resolved$reference
   }
+  f <- factor(as.character(values), levels = resolved$levels)
+  attr(f, "priority_levels") <- resolved$levels
   f
 }
 
-ensure_reference_group_present <- function(group_counts, reference) {
-  if (is.null(reference) || is.na(reference) || !nzchar(reference)) {
-    return(invisible(TRUE))
+ensure_reference_group_present <- function(group_counts) {
+  if (length(group_counts) == 0) {
+    stop("No groups available to evaluate reference.")
   }
-  if (!(reference %in% names(group_counts))) {
-    stop(
-      sprintf(
-        "Specified group_ref '%s' is absent after QC filtering. Update configure.tsv or choose another reference.",
-        reference
-      )
-    )
+  resolved <- resolve_group_levels(names(group_counts))
+  if (is.null(resolved$reference) || is.na(resolved$reference) || !nzchar(resolved$reference)) {
+    stop("Unable to resolve a reference group from available groups: ", paste(names(group_counts), collapse = ", "))
   }
-  invisible(TRUE)
+  if (!is.null(group_reference_resolved) && !is.na(group_reference_resolved) && group_reference_resolved != resolved$reference) {
+    log_message("Reference group updated after QC/filtering: %s -> %s", group_reference_resolved, resolved$reference)
+  }
+  group_reference_resolved <<- resolved$reference
+  invisible(resolved$reference)
 }
 
-build_group_contrast_table <- function(group_levels, group_columns) {
+build_group_contrast_table <- function(group_levels, group_columns, priority_order = NULL) {
   if (length(group_levels) < 2 || length(group_columns) == 0) {
     return(data.table())
   }
@@ -752,17 +774,27 @@ build_group_contrast_table <- function(group_levels, group_columns) {
     target_group = names(column_map),
     comparison = sprintf("%s_vs_%s", names(column_map), baseline)
   )
+  priority_order <- priority_order %||% group_levels
+  priority_rank <- setNames(seq_along(priority_order), priority_order)
   if (length(mapping_levels) > 1) {
     combos <- utils::combn(mapping_levels, 2, simplify = FALSE)
     if (length(combos) > 0) {
       extra <- rbindlist(
         lapply(combos, function(pair) {
+          ranks <- priority_rank[pair]
+          if (any(is.na(ranks))) {
+            ref <- pair[2]
+            target <- pair[1]
+          } else {
+            ref <- pair[which.min(ranks)]
+            target <- setdiff(pair, ref)
+          }
           list(
             coef = NA_character_,
-            contrast_formula = sprintf("%s - %s", column_map[[pair[1]]], column_map[[pair[2]]]),
-            reference_group = pair[2],
-            target_group = pair[1],
-            comparison = sprintf("%s_vs_%s", pair[1], pair[2])
+            contrast_formula = sprintf("%s - %s", column_map[[target]], column_map[[ref]]),
+            reference_group = ref,
+            target_group = target,
+            comparison = sprintf("%s_vs_%s", target, ref)
           )
         }),
         fill = TRUE
@@ -799,6 +831,7 @@ construct_design <- function(groups, numeric_covars, factor_covars, data, surrog
   }
   colnames(design) <- sanitized_colnames
   group_levels <- levels(group_factor)
+  priority_levels <- attr(group_factor, "priority_levels") %||% group_levels
   group_cols <- grep("^group", colnames(design), value = TRUE)
   if (length(group_cols) == length(group_levels) - 1) {
     names(group_cols) <- group_levels[-1]
@@ -806,12 +839,14 @@ construct_design <- function(groups, numeric_covars, factor_covars, data, surrog
   attr(design, "group_levels") <- group_levels
   attr(design, "group_columns") <- group_cols
   if (length(group_levels) >= 2 && length(group_cols) >= 1) {
-    contrast_info <- build_group_contrast_table(group_levels, group_cols)
+    contrast_info <- build_group_contrast_table(group_levels, group_cols, priority_levels)
   } else {
     contrast_info <- data.table()
   }
   attr(design, "group_contrasts") <- contrast_info
-  attr(design, "reference_group") <- if (length(group_levels) > 0) group_levels[1] else NA_character_
+  attr(design, "group_priority_order") <- priority_levels
+  resolved_ref <- group_reference_resolved %||% if (length(group_levels) > 0) group_levels[1] else NA_character_
+  attr(design, "reference_group") <- resolved_ref
   design
 }
 
@@ -2084,6 +2119,65 @@ write_empty_plot <- function(filename, title, message = "Not enough data to rend
   log_message("Wrote placeholder plot %s (no data)", filename)
 }
 
+sanitize_comparison_label <- function(x) {
+  out <- gsub("[^A-Za-z0-9]+", "_", x)
+  out <- gsub("_+", "_", out)
+  out <- sub("^_+", "", out)
+  out <- sub("_+$", "", out)
+  if (!nzchar(out)) {
+    out <- "comparison"
+  }
+  out
+}
+
+write_plotly_comparison_set <- function(res, base_key, base_title, builder_fn, base_filename, fallback_subtitle = NULL) {
+  outputs <- list()
+  if (is.null(res) || nrow(res) == 0) {
+    return(outputs)
+  }
+  comps <- if ("comparison" %in% names(res)) unique(na.omit(as.character(res$comparison))) else character()
+  if (length(comps) <= 1) {
+    widget <- builder_fn(res, base_title)
+    if (!is.null(widget)) {
+      path <- create_interactive(
+        widget,
+        base_filename,
+        title = base_title,
+        subtitle = fallback_subtitle %||% default_widget_subtitle(widget),
+        description = default_widget_description(widget)
+      )
+      if (!is.null(path)) {
+        outputs[[base_key]] <- path
+      }
+    }
+    return(outputs)
+  }
+  for (comp in comps) {
+    subset <- res[res$comparison == comp, , drop = FALSE]
+    if (nrow(subset) == 0) {
+      next
+    }
+    label <- sprintf("%s · %s", base_title, comp)
+    safe_comp <- sanitize_comparison_label(comp)
+    filename <- paste0(base_filename, "_", safe_comp)
+    widget <- builder_fn(subset, label)
+    if (is.null(widget)) {
+      next
+    }
+    path <- create_interactive(
+      widget,
+      filename,
+      title = label,
+      subtitle = fallback_subtitle %||% sprintf("Comparison: %s", comp),
+      description = default_widget_description(widget)
+    )
+    if (!is.null(path)) {
+      outputs[[paste0(base_key, "_", safe_comp)]] <- path
+    }
+  }
+  outputs
+}
+
 create_top_cpg_heatmaps <- function(beta_matrix, annotated_results, metadata, fig_dir, interactive_dir, pipeline_label = "minfi", top_n = 100) {
   outputs <- list(static = list(), interactive = list())
   if (is.null(beta_matrix) || is.null(annotated_results) || nrow(annotated_results) == 0) {
@@ -2340,8 +2434,34 @@ interactive_output_metadata <- function(key) {
       title = sprintf("Heatmap · %s", comparison),
       subtitle = "Top CpGs (z-scored corrected beta values) with gene labels where available.",
       description = "Columns show samples (group label in axis text); rows are clustered CpGs labelled as gene_probe when annotation exists.",
-      category = "Differential Analysis",
+      category = "Heatmaps",
       icon = "HM"
+    ))
+  }
+  if (grepl("^volcano_(minfi|sesame|intersection)_", key)) {
+    parts <- strsplit(key, "_", fixed = TRUE)[[1]]
+    pipeline <- parts[2]
+    comp <- paste(parts[3:length(parts)], collapse = "_")
+    title <- sprintf("Volcano · %s · %s", pipeline, format_identifier_title(comp))
+    return(list(
+      title = title,
+      subtitle = sprintf("Pipeline: %s | Comparison: %s", pipeline, gsub("_", " ", comp)),
+      description = "Hover for CpG IDs, delta beta, and p-values for this comparison.",
+      category = "Volcano",
+      icon = "DA"
+    ))
+  }
+  if (grepl("^manhattan_(minfi|sesame|intersection)_", key)) {
+    parts <- strsplit(key, "_", fixed = TRUE)[[1]]
+    pipeline <- parts[2]
+    comp <- paste(parts[3:length(parts)], collapse = "_")
+    title <- sprintf("Manhattan · %s · %s", pipeline, format_identifier_title(comp))
+    return(list(
+      title = title,
+      subtitle = sprintf("Pipeline: %s | Comparison: %s", pipeline, gsub("_", " ", comp)),
+      description = "Genome-wide Manhattan plot for this comparison.",
+      category = "Manhattan",
+      icon = "GX"
     ))
   }
   switch(
@@ -2364,42 +2484,42 @@ interactive_output_metadata <- function(key) {
       title = "Volcano · minfi",
       subtitle = "-log10(p-value) versus delta beta. Firebrick markers pass the FDR threshold.",
       description = "Hover for CpG IDs, delta beta, and p-values derived from the minfi pipeline.",
-      category = "Differential Analysis",
+      category = "Volcano",
       icon = "DA"
     ),
     volcano_sesame = list(
       title = "Volcano · sesame",
       subtitle = "-log10(p-value) versus delta beta for sesame results.",
       description = "Hold shift to zoom along an axis and use the toolbar to export high-resolution images.",
-      category = "Differential Analysis",
+      category = "Volcano",
       icon = "DA"
     ),
     volcano_intersection = list(
       title = "Volcano · intersection",
       subtitle = "Shared signals across pipelines visualised in a volcano plot.",
       description = "Inspect consistent CpGs that meet the filtering thresholds in both pipelines.",
-      category = "Differential Analysis",
+      category = "Volcano",
       icon = "DA"
     ),
     manhattan_minfi = list(
       title = "Manhattan · minfi",
       subtitle = "Genome-wide distribution of -log10(p-value) signals for minfi.",
       description = "Drag horizontally to zoom into genomic regions and inspect CpG annotations.",
-      category = "Genomic Context",
+      category = "Manhattan",
       icon = "GX"
     ),
     manhattan_sesame = list(
       title = "Manhattan · sesame",
       subtitle = "Sesame-based Manhattan plot with interactive zoom and hover.",
       description = "Toggle legend entries to highlight one group or significance band at a time.",
-      category = "Genomic Context",
+      category = "Manhattan",
       icon = "GX"
     ),
     manhattan_intersection = list(
       title = "Manhattan · intersection",
       subtitle = "Intersection hits highlighted across the genome.",
       description = "Spot reproducible genomic hotspots with consistent differential methylation.",
-      category = "Genomic Context",
+      category = "Manhattan",
       icon = "GX"
     ),
     overlap_minfi_sesame = list(
@@ -3224,6 +3344,36 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
     )
   }
 
+  comparison_section <- NULL
+  comparisons <- summary$comparisons %||% list()
+  if (length(comparisons) > 0) {
+    comparison_items <- lapply(seq_along(comparisons), function(i) {
+      item <- comparisons[[i]]
+      tgt <- item$target_group %||% item$target %||% "Target"
+      ref <- item$reference_group %||% item$reference %||% "Reference"
+      label <- item$comparison %||% sprintf("%s_vs_%s", tgt, ref)
+      contrast <- item$contrast_formula %||% item$coef %||% ""
+      htmltools::tags$li(
+        class = "dm-comparison-item",
+        htmltools::tags$div(
+          class = "dm-comparison-item__header",
+          htmltools::tags$span(class = "dm-comparison-item__index", sprintf("%02d", i)),
+          htmltools::tags$div(
+            class = "dm-comparison-item__labels",
+            htmltools::tags$span(class = "dm-comparison-item__title", format_identifier_title(label)),
+            htmltools::tags$span(class = "dm-comparison-item__subtitle", sprintf("%s \u2192 %s", ref, tgt))
+          )
+        ),
+        if (nzchar(contrast)) htmltools::tags$span(class = "dm-comparison-item__meta", contrast)
+      )
+    })
+    comparison_section <- htmltools::tags$section(
+      class = "dm-section",
+      htmltools::tags$h2(class = "dm-section__title", "Group comparisons"),
+      htmltools::tags$ul(class = "dm-comparison-list", comparison_items)
+    )
+  }
+
   batch_covariate_section <- NULL
   if (length(batch_covariate_cards) > 0) {
     cards <- lapply(batch_covariate_cards, function(item) item$card)
@@ -3337,7 +3487,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
   if (length(runtime_files) > 0) {
     runtime_cards <- lapply(names(runtime_files), function(name) {
       file_path <- runtime_files[[name]]
-      if (is.null(file_path) || !nzchar(file_path)) {
+      if (is.null(file_path) || length(file_path) == 0 || all(is.na(file_path)) || all(!nzchar(file_path %||% ""))) {
         return(NULL)
       }
       href <- relative_to_root(file_path, project_root)
@@ -3382,6 +3532,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
     group_badges,
     sig_section,
     if (!is.null(overlap_sentence)) htmltools::tags$p(class = "dm-text-note", overlap_sentence),
+    comparison_section,
     batch_covariate_section,
     covariate_section,
     interactive_block,
@@ -3630,6 +3781,53 @@ a { color: inherit; text-decoration: none; }
   font-weight: 600;
   color: #38BDF8;
 }
+.dm-comparison-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.dm-comparison-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.7);
+}
+.dm-comparison-item__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dm-comparison-item__index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: rgba(59, 130, 246, 0.16);
+  color: #90caf9;
+  font-weight: 700;
+}
+.dm-comparison-item__title {
+  font-weight: 700;
+  color: #f8fafc;
+  display: block;
+}
+.dm-comparison-item__subtitle {
+  color: rgba(148, 163, 184, 0.9);
+  font-size: 0.92rem;
+  display: block;
+}
+.dm-comparison-item__meta {
+  color: rgba(148, 163, 184, 0.7);
+  font-size: 0.9rem;
+}
 .dm-table-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
@@ -3760,24 +3958,35 @@ if (any(group_counts < opt$min_group_size)) {
 }
 
 if (!is.null(opt$group_ref) && nzchar(trimws(opt$group_ref))) {
-  candidate_ref <- trimws(opt$group_ref)
+  priority <- unique(trimws(strsplit(opt$group_ref, ",")[[1]]))
+  priority <- priority[priority != ""]
+  if (length(priority) == 0) {
+    stop("--group-ref cannot be empty after trimming")
+  }
+  group_reference_priority <<- priority
   unique_groups <- unique(config$dear_group)
-  if (!(candidate_ref %in% unique_groups)) {
-    stop(
-      sprintf(
-        "Specified --group-ref '%s' not found in dear_group values. Available groups: %s",
-        candidate_ref,
-        paste(sort(unique_groups), collapse = ", ")
-      )
+  matched <- priority[priority %in% unique_groups]
+  if (length(matched) == 0) {
+    log_message(
+      "None of the requested --group-ref priorities are present (%s); will auto-detect reference.",
+      paste(priority, collapse = ", ")
+    )
+  } else {
+    log_message(
+      "Group reference priority: %s (present: %s)",
+      paste(priority, collapse = ", "),
+      paste(matched, collapse = ", ")
     )
   }
-  group_reference <- candidate_ref
-  log_message("Using %s as the reference group for contrasts.", group_reference)
+  resolved <- resolve_group_levels(unique_groups)
+  group_reference_resolved <<- resolved$reference
+  log_message("Using %s as the initial reference group for contrasts.", group_reference_resolved)
 } else {
-  group_reference <- NA_character_
+  group_reference_priority <<- character()
+  group_reference_resolved <<- NA_character_
 }
 
-ensure_reference_group_present(group_counts, group_reference)
+ensure_reference_group_present(group_counts)
 
 log_message("Loaded", nrow(config), "samples for analysis across groups:", paste(names(group_counts), group_counts, sep = "=", collapse = "; "))
 
@@ -3867,7 +4076,7 @@ if (length(drop_samples) > 0) {
       paste(names(group_counts[group_counts < opt$min_group_size]), collapse = ", ")
     )
   }
-  ensure_reference_group_present(group_counts, group_reference)
+  ensure_reference_group_present(group_counts)
   log_message(
     "Post-QC sample counts: %s",
     paste(names(group_counts), group_counts, sep = "=", collapse = "; ")
@@ -4151,7 +4360,7 @@ if (sesame_available && length(sesame_betas) > 0) {
           paste(names(group_counts[group_counts < opt$min_group_size]), collapse = ", ")
         )
       }
-      ensure_reference_group_present(group_counts, group_reference)
+      ensure_reference_group_present(group_counts)
       log_message(
         "Post-sesame QC sample counts: %s",
         paste(names(group_counts), group_counts, sep = "=", collapse = "; ")
@@ -5586,6 +5795,30 @@ prepare_volcano_data <- function(results, fdr_threshold = opt$fdr_threshold, sam
   df
 }
 
+write_volcano_set <- function(results, title_prefix, path_prefix) {
+  if (is.null(results) || nrow(results) == 0) {
+    write_empty_plot(path_prefix, title_prefix, "No data available")
+    return(invisible(NULL))
+  }
+  comps <- if ("comparison" %in% names(results)) unique(na.omit(as.character(results$comparison))) else character()
+  if (length(comps) <= 1) {
+    if (!write_plot(volcano_plot(results, title_prefix), path_prefix)) {
+      write_volcano_base(results, title_prefix, path_prefix)
+    }
+    return(invisible(NULL))
+  }
+  for (comp in comps) {
+    subset <- results[results$comparison == comp, , drop = FALSE]
+    if (nrow(subset) == 0) next
+    label <- sprintf("%s (%s)", title_prefix, comp)
+    filename <- paste0(path_prefix, "_", sanitize_comparison_label(comp))
+    if (!write_plot(volcano_plot(subset, label), filename)) {
+      write_volcano_base(subset, label, filename)
+    }
+  }
+  invisible(NULL)
+}
+
 volcano_plot <- function(results, title, fdr_threshold = opt$fdr_threshold) {
   log_message(
     "volcano_plot input for %s: rows=%s, class=%s",
@@ -5878,21 +6111,12 @@ write_table_widget <- function(data, filename, title, subtitle = NULL, descripti
 volcano_minfi_classes <- paste(sprintf("%s(%s)", names(results_minfi), sapply(results_minfi, function(col) paste(class(col), collapse = "/"))), collapse = ", ")
 log_message("volcano_minfi columns: %s", volcano_minfi_classes)
 log_message("volcano_minfi rows: %s (finite adj.P.Val: %s)", nrow(results_minfi), sum(is.finite(results_minfi$adj.P.Val)))
-if (!write_plot(volcano_plot(results_minfi, "Volcano minfi"), file.path(fig_dir, "volcano_minfi"))) {
-  write_volcano_base(results_minfi, "Volcano minfi", file.path(fig_dir, "volcano_minfi"))
-}
+write_volcano_set(results_minfi, "Volcano minfi", file.path(fig_dir, "volcano_minfi"))
 volcano_sesame_classes <- paste(sprintf("%s(%s)", names(results_sesame), sapply(results_sesame, function(col) paste(class(col), collapse = "/"))), collapse = ", ")
 log_message("volcano_sesame columns: %s", volcano_sesame_classes)
 log_message("volcano_sesame rows: %s (finite adj.P.Val: %s)", nrow(results_sesame), sum(is.finite(results_sesame$adj.P.Val)))
-if (!write_plot(volcano_plot(results_sesame, "Volcano sesame"), file.path(fig_dir, "volcano_sesame"))) {
-  write_volcano_base(results_sesame, "Volcano sesame", file.path(fig_dir, "volcano_sesame"))
-}
-if (nrow(integrated$intersection) > 0) {
-  write_plot(volcano_plot(integrated$intersection, "Volcano intersection"), file.path(fig_dir, "volcano_intersection"))
-} else {
-  log_message("Skipping volcano intersection static plot: no shared CpGs available.")
-  write_empty_plot(file.path(fig_dir, "volcano_intersection"), "Volcano intersection", "No shared CpGs passed the filters.")
-}
+write_volcano_set(results_sesame, "Volcano sesame", file.path(fig_dir, "volcano_sesame"))
+write_volcano_set(integrated$intersection, "Volcano intersection", file.path(fig_dir, "volcano_intersection"))
 
 density_plot <- function(beta_matrix, title) {
   df <- melt(as.data.table(beta_matrix, keep.rownames = "probe_id"), id.vars = "probe_id", variable.name = "sample", value.name = "beta")
@@ -5988,6 +6212,26 @@ prepare_manhattan_df <- function(res) {
   list(data = df, centers = centers, label_df = label_df, reason = NULL)
 }
 
+write_manhattan_set <- function(res, title_prefix, path_prefix) {
+  if (is.null(res) || nrow(res) == 0) {
+    write_empty_plot(path_prefix, title_prefix, "No data available")
+    return(invisible(NULL))
+  }
+  comps <- if ("comparison" %in% names(res)) unique(na.omit(as.character(res$comparison))) else character()
+  if (length(comps) <= 1) {
+    write_plot(manhattan_plot(res, title_prefix), path_prefix)
+    return(invisible(NULL))
+  }
+  for (comp in comps) {
+    subset <- res[res$comparison == comp, , drop = FALSE]
+    if (nrow(subset) == 0) next
+    label <- sprintf("%s (%s)", title_prefix, comp)
+    filename <- paste0(path_prefix, "_", sanitize_comparison_label(comp))
+    write_plot(manhattan_plot(subset, label), filename)
+  }
+  invisible(NULL)
+}
+
 manhattan_plot <- function(res, title) {
   prep <- prepare_manhattan_df(res)
   if (is.null(prep$data)) {
@@ -6062,14 +6306,9 @@ build_manhattan_plotly <- function(res, title) {
   plot_obj
 }
 
-write_plot(manhattan_plot(annotated_minfi, "Manhattan minfi"), file.path(fig_dir, "manhattan_minfi"))
-write_plot(manhattan_plot(annotated_sesame, "Manhattan sesame"), file.path(fig_dir, "manhattan_sesame"))
-if (nrow(annotated_intersection) > 0) {
-  write_plot(manhattan_plot(annotated_intersection, "Manhattan intersection"), file.path(fig_dir, "manhattan_intersection"))
-} else {
-  log_message("Skipping Manhattan intersection static plot: no shared CpGs available.")
-  write_empty_plot(file.path(fig_dir, "manhattan_intersection"), "Manhattan intersection", "No shared CpGs passed the filters.")
-}
+write_manhattan_set(annotated_minfi, "Manhattan minfi", file.path(fig_dir, "manhattan_minfi"))
+write_manhattan_set(annotated_sesame, "Manhattan sesame", file.path(fig_dir, "manhattan_sesame"))
+write_manhattan_set(annotated_intersection, "Manhattan intersection", file.path(fig_dir, "manhattan_intersection"))
 
 qq_plot <- function(res, title) {
   df <- as.data.frame(res)
@@ -6185,58 +6424,64 @@ if (nrow(sig_minfi) > 0 || nrow(sig_sesame) > 0) {
 
 # ---- Interactive outputs ----------------------------------------------------
 
-log_message("Creating interactive visuals...")
 interactive_dir <- paths$interactive
-
+dir.create(interactive_dir, recursive = TRUE, showWarnings = FALSE)
 interactive_files <- list()
+has_bitmap_device <- any(capabilities()[c("cairo", "png", "jpeg")])
 
-heatmap_outputs <- create_top_cpg_heatmaps(
-  beta_matrix = beta_minfi,
-  annotated_results = annotated_minfi,
-  metadata = metadata_dt,
-  fig_dir = fig_dir,
-  interactive_dir = interactive_dir,
-  pipeline_label = "minfi",
-  top_n = min(100, opt$top_n_cpgs %||% 100)
-)
-if (length(heatmap_outputs$interactive) > 0) {
-  interactive_files <- c(interactive_files, heatmap_outputs$interactive)
-}
+if (!isTRUE(has_bitmap_device)) {
+  log_message("Skipping interactive outputs: no cairo/png/jpeg device available.")
+} else {
+  log_message("Creating interactive visuals...")
 
-heatmap_outputs_intersection <- create_top_cpg_heatmaps(
-  beta_matrix = beta_intersection_heatmap,
-  annotated_results = annotated_intersection,
-  metadata = metadata_dt,
-  fig_dir = fig_dir,
-  interactive_dir = interactive_dir,
-  pipeline_label = "intersection",
-  top_n = min(100, opt$top_n_cpgs %||% 100)
-)
-if (length(heatmap_outputs_intersection$interactive) > 0) {
-  interactive_files <- c(interactive_files, heatmap_outputs_intersection$interactive)
-}
+  tryCatch({
+    heatmap_outputs <- create_top_cpg_heatmaps(
+      beta_matrix = beta_minfi,
+      annotated_results = annotated_minfi,
+      metadata = metadata_dt,
+      fig_dir = fig_dir,
+      interactive_dir = interactive_dir,
+      pipeline_label = "minfi",
+      top_n = min(100, opt$top_n_cpgs %||% 100)
+    )
+    if (length(heatmap_outputs$interactive) > 0) {
+      interactive_files <- c(interactive_files, heatmap_outputs$interactive)
+    }
 
-if (sesame_available && !is.null(beta_sesame) && nrow(beta_sesame) > 0) {
-  heatmap_outputs_sesame <- create_top_cpg_heatmaps(
-    beta_matrix = beta_sesame,
-    annotated_results = annotated_sesame,
-    metadata = metadata_dt,
-    fig_dir = fig_dir,
-    interactive_dir = interactive_dir,
-    pipeline_label = "sesame",
-    top_n = min(100, opt$top_n_cpgs %||% 100)
-  )
-  if (length(heatmap_outputs_sesame$interactive) > 0) {
-    interactive_files <- c(interactive_files, heatmap_outputs_sesame$interactive)
-  }
-}
+    heatmap_outputs_intersection <- create_top_cpg_heatmaps(
+      beta_matrix = beta_intersection_heatmap,
+      annotated_results = annotated_intersection,
+      metadata = metadata_dt,
+      fig_dir = fig_dir,
+      interactive_dir = interactive_dir,
+      pipeline_label = "intersection",
+      top_n = min(100, opt$top_n_cpgs %||% 100)
+    )
+    if (length(heatmap_outputs_intersection$interactive) > 0) {
+      interactive_files <- c(interactive_files, heatmap_outputs_intersection$interactive)
+    }
+
+    if (sesame_available && !is.null(beta_sesame) && nrow(beta_sesame) > 0) {
+      heatmap_outputs_sesame <- create_top_cpg_heatmaps(
+        beta_matrix = beta_sesame,
+        annotated_results = annotated_sesame,
+        metadata = metadata_dt,
+        fig_dir = fig_dir,
+        interactive_dir = interactive_dir,
+        pipeline_label = "sesame",
+        top_n = min(100, opt$top_n_cpgs %||% 100)
+      )
+      if (length(heatmap_outputs_sesame$interactive) > 0) {
+        interactive_files <- c(interactive_files, heatmap_outputs_sesame$interactive)
+      }
+    }
 
 guard_interactive <- function(label, expr) {
   tryCatch(
     force(expr),
     error = function(e) {
       trace <- tryCatch(paste(utils::capture.output(traceback()), collapse = " | "), error = function(...) "No traceback available")
-      log_message("Interactive output %s failed: %s | Trace: %s", label, conditionMessage(e), trace)
+      try(log_message("Interactive output %s failed: %s | Trace: %s", label, conditionMessage(e), trace), silent = TRUE)
       NULL
     }
   )
@@ -6290,14 +6535,23 @@ guard_interactive("model_selection_table", {
 })
 guard_interactive("pca_pre", {
   meta <- interactive_output_metadata("pca_pre")
-  path <- create_interactive(
+  widget <- tryCatch(
     ggplotly(pca_plots[[1]]),
-    file.path(interactive_dir, "pca_pre"),
-    title = meta$title,
-    subtitle = meta$subtitle,
-    description = meta$description
+    error = function(e) {
+      log_message("Skipping interactive pca_pre: %s", conditionMessage(e))
+      NULL
+    }
   )
-  if (!is.null(path)) interactive_files$pca_pre <- path
+  if (!is.null(widget)) {
+    path <- create_interactive(
+      widget,
+      file.path(interactive_dir, "pca_pre"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$pca_pre <- path
+  }
 })
 guard_interactive("pca_post", {
   meta <- interactive_output_metadata("pca_post")
@@ -6305,77 +6559,63 @@ guard_interactive("pca_post", {
     meta$title <- paste0(meta$title, " · no correction")
     meta$subtitle <- "No batch/SVA adjustment was applied; plot matches the pre-correction PCA."
   }
-  path <- create_interactive(
+  widget <- tryCatch(
     ggplotly(pca_plots[[2]]),
-    file.path(interactive_dir, "pca_post"),
-    title = meta$title,
-    subtitle = meta$subtitle,
-    description = meta$description
+    error = function(e) {
+      log_message("Skipping interactive pca_post: %s", conditionMessage(e))
+      NULL
+    }
   )
-  if (!is.null(path)) interactive_files$pca_post <- path
+  if (!is.null(widget)) {
+    path <- create_interactive(
+      widget,
+      file.path(interactive_dir, "pca_post"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$pca_post <- path
+  }
 })
 guard_interactive("volcano_minfi", {
-  meta <- interactive_output_metadata("volcano_minfi")
-  volcano_minfi_widget <- build_volcano_plotly(annotated_minfi, "Volcano minfi")
-  if (!is.null(volcano_minfi_widget)) {
-    path <- create_interactive(
-      volcano_minfi_widget,
-      file.path(interactive_dir, "volcano_minfi"),
-      title = meta$title,
-      subtitle = meta$subtitle,
-      description = meta$description
-    )
-  } else {
-    path <- NULL
-  }
-  if (!is.null(path)) {
-    interactive_files$volcano_minfi <- path
-  } else {
-    fallback <- write_volcano_plotly(annotated_minfi, "Volcano minfi", file.path(interactive_dir, "volcano_minfi"))
-    if (!is.null(fallback)) interactive_files$volcano_minfi <- fallback
-  }
+  plot_paths <- write_plotly_comparison_set(
+    annotated_minfi,
+    "volcano_minfi",
+    "Volcano · minfi",
+    build_volcano_plotly,
+    file.path(interactive_dir, "volcano_minfi")
+  )
+  interactive_files <- c(interactive_files, plot_paths)
 })
 guard_interactive("volcano_intersection", {
-  meta <- interactive_output_metadata("volcano_intersection")
-  volcano_intersection_widget <- build_volcano_plotly(integrated$intersection, "Volcano intersection")
-  if (!is.null(volcano_intersection_widget)) {
-    path <- create_interactive(
-      volcano_intersection_widget,
-      file.path(interactive_dir, "volcano_intersection"),
-      title = meta$title,
-      subtitle = meta$subtitle,
-      description = meta$description
-    )
-    if (!is.null(path)) interactive_files$volcano_intersection <- path
-  }
+  plot_paths <- write_plotly_comparison_set(
+    integrated$intersection,
+    "volcano_intersection",
+    "Volcano · intersection",
+    build_volcano_plotly,
+    file.path(interactive_dir, "volcano_intersection")
+  )
+  interactive_files <- c(interactive_files, plot_paths)
 })
 guard_interactive("manhattan_minfi", {
-  meta <- interactive_output_metadata("manhattan_minfi")
-  manhattan_minfi_widget <- build_manhattan_plotly(annotated_minfi, "Manhattan minfi")
-  if (!is.null(manhattan_minfi_widget)) {
-    path <- create_interactive(
-      manhattan_minfi_widget,
-      file.path(interactive_dir, "manhattan_minfi"),
-      title = meta$title,
-      subtitle = meta$subtitle,
-      description = meta$description
-    )
-    if (!is.null(path)) interactive_files$manhattan_minfi <- path
-  }
+  plot_paths <- write_plotly_comparison_set(
+    annotated_minfi,
+    "manhattan_minfi",
+    "Manhattan · minfi",
+    build_manhattan_plotly,
+    file.path(interactive_dir, "manhattan_minfi")
+  )
+  interactive_files <- c(interactive_files, plot_paths)
 })
 guard_interactive("manhattan_intersection", {
-  meta <- interactive_output_metadata("manhattan_intersection")
-  manhattan_intersection_widget <- build_manhattan_plotly(annotated_intersection, "Manhattan intersection")
-  if (!is.null(manhattan_intersection_widget)) {
-    path <- create_interactive(
-      manhattan_intersection_widget,
-      file.path(interactive_dir, "manhattan_intersection"),
-      title = meta$title,
-      subtitle = meta$subtitle,
-      description = meta$description
-    )
-    if (!is.null(path)) interactive_files$manhattan_intersection <- path
-  }
+  plot_paths <- write_plotly_comparison_set(
+    annotated_intersection,
+    "manhattan_intersection",
+    "Manhattan · intersection",
+    build_manhattan_plotly,
+    file.path(interactive_dir, "manhattan_intersection")
+  )
+  interactive_files <- c(interactive_files, plot_paths)
 })
 
 guard_interactive("table_minfi", {
@@ -6416,38 +6656,27 @@ guard_interactive("table_intersection_dual", {
 if (sesame_available && nrow(results_sesame) > 0) {
   guard_interactive("volcano_sesame", {
     meta <- interactive_output_metadata("volcano_sesame")
-    volcano_sesame_widget <- build_volcano_plotly(annotated_sesame, "Volcano sesame")
-    if (!is.null(volcano_sesame_widget)) {
-      path <- create_interactive(
-        volcano_sesame_widget,
-        file.path(interactive_dir, "volcano_sesame"),
-        title = meta$title,
-        subtitle = meta$subtitle,
-        description = meta$description
-      )
-    } else {
-      path <- NULL
-    }
-    if (!is.null(path)) {
-      interactive_files$volcano_sesame <- path
-    } else {
-      fallback <- write_volcano_plotly(annotated_sesame, "Volcano sesame", file.path(interactive_dir, "volcano_sesame"))
-      if (!is.null(fallback)) interactive_files$volcano_sesame <- fallback
-    }
+    plot_paths <- write_plotly_comparison_set(
+      annotated_sesame,
+      "volcano_sesame",
+      "Volcano · sesame",
+      build_volcano_plotly,
+      file.path(interactive_dir, "volcano_sesame"),
+      fallback_subtitle = meta$subtitle
+    )
+    interactive_files <- c(interactive_files, plot_paths)
   })
   guard_interactive("manhattan_sesame", {
     meta <- interactive_output_metadata("manhattan_sesame")
-    manhattan_sesame_widget <- build_manhattan_plotly(annotated_sesame, "Manhattan sesame")
-    if (!is.null(manhattan_sesame_widget)) {
-      path <- create_interactive(
-        manhattan_sesame_widget,
-        file.path(interactive_dir, "manhattan_sesame"),
-        title = meta$title,
-        subtitle = meta$subtitle,
-        description = meta$description
-      )
-      if (!is.null(path)) interactive_files$manhattan_sesame <- path
-    }
+    plot_paths <- write_plotly_comparison_set(
+      annotated_sesame,
+      "manhattan_sesame",
+      "Manhattan · sesame",
+      build_manhattan_plotly,
+      file.path(interactive_dir, "manhattan_sesame"),
+      fallback_subtitle = meta$subtitle
+    )
+    interactive_files <- c(interactive_files, plot_paths)
   })
   guard_interactive("table_sesame", {
     meta <- interactive_output_metadata("table_sesame")
@@ -6573,9 +6802,31 @@ guard_interactive("batch_qc", {
   }
 })
 
+# End interactive generation (best effort)
+  }, error = function(e) {
+    log_message("Interactive generation aborted: %s", conditionMessage(e))
+  })
+}
+
+# Remove failed/empty interactive entries and drop NA paths before summarising
+clean_paths <- function(x) {
+  if (is.null(x)) return(character())
+  if (!is.atomic(x)) {
+    x <- unlist(x, use.names = FALSE)
+  }
+  x <- x[!is.na(x)]
+  x <- x[nzchar(x)]
+  unique(as.character(x))
+}
+interactive_files <- lapply(interactive_files, clean_paths)
+interactive_files <- Filter(function(x) length(x) > 0, interactive_files)
+
 # ---- Summary ----------------------------------------------------------------
 
 manifest_entries <- function(dir_path) {
+  if (is.null(dir_path) || is.na(dir_path) || !dir.exists(dir_path)) {
+    return(list())
+  }
   files <- list.files(dir_path, full.names = TRUE)
   lapply(files, function(p) {
     info <- file.info(p)
@@ -6742,7 +6993,7 @@ summary <- list(
   p_threshold = opt$p_threshold,
   delta_beta_threshold = opt$delta_beta_threshold,
   groups = as.list(group_counts),
-  group_reference = if (!is.null(group_reference) && !is.na(group_reference)) group_reference else NA_character_,
+  group_reference = if (!is.null(group_reference_resolved) && !is.na(group_reference_resolved)) group_reference_resolved else NA_character_,
   candidate_batches = list(
     auto = batch_tracking$auto,
     manual = batch_tracking$manual,
@@ -6783,6 +7034,11 @@ summary <- list(
     sesame = nrow(sig_sesame),
     intersection = nrow(integrated$intersection)
   ),
+  comparisons = if (!is.null(group_comparisons) && nrow(group_comparisons) > 0) {
+    lapply(seq_len(nrow(group_comparisons)), function(i) as.list(group_comparisons[i]))
+  } else {
+    list()
+  },
   overlap_top_n = detailed_overlap_stats,
   top_cpgs = top_cpgs,
   batch_metrics = batch_metrics,
@@ -6815,6 +7071,13 @@ summary$dashboard <- list(
   root = dashboard_paths$root,
   interactive = dashboard_paths$interactive
 )
-write_json(summary, file.path(paths$runtime, "analysis_summary.json"), pretty = TRUE, auto_unbox = TRUE)
+runtime_summary_path <- file.path(paths$runtime %||% project_root, "analysis_summary.json")
+root_summary_path <- file.path(project_root, "analysis_summary.json")
+log_message("Summary outputs:", runtime_summary_path, root_summary_path)
+dir.create(dirname(runtime_summary_path), recursive = TRUE, showWarnings = FALSE)
+write_json(summary, runtime_summary_path, pretty = TRUE, auto_unbox = TRUE)
+if (!identical(root_summary_path, runtime_summary_path)) {
+  write_json(summary, root_summary_path, pretty = TRUE, auto_unbox = TRUE)
+}
 
 log_message("DearMeta analysis completed successfully.")

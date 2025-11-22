@@ -13,7 +13,9 @@ cran_packages <- c(
   htmlwidgets = "1.6.4",
   DT = "0.34.0",
   RColorBrewer = "1.1-3",
-  VennDiagram = "1.7.3"
+  VennDiagram = "1.7.3",
+  Cairo = "1.6-2",
+  ragg = "1.3.2"
 )
 
 bioc_package_matrix <- list(
@@ -118,6 +120,36 @@ bioc_selection <- select_bioc_packages(bioc_package_matrix)
 ensure_bioc(bioc_selection$packages, bioc_selection$version)
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
+
+install_bitmap_support <- function() {
+  # Plotly/ggplotly needs a bitmap device for sizing; Cairo/ragg provide it.
+  required_caps <- c("cairo", "png", "jpeg")
+  current_caps <- capabilities()[required_caps]
+  if (any(current_caps)) {
+    return(invisible(TRUE))
+  }
+  message("No bitmap device detected (cairo/png/jpeg); attempting to install Cairo and ragg.")
+  tryCatch(
+    {
+      if (requireNamespace("Cairo", quietly = TRUE) && requireNamespace("ragg", quietly = TRUE)) {
+        return(invisible(TRUE))
+      }
+      remotes::install_version("Cairo", version = cran_packages[["Cairo"]], repos = "https://cloud.r-project.org", upgrade = "never", quiet = TRUE)
+      remotes::install_version("ragg", version = cran_packages[["ragg"]], repos = "https://cloud.r-project.org", upgrade = "never", quiet = TRUE)
+    },
+    error = function(e) {
+      warning(
+        sprintf(
+          "Bitmap device install failed: %s. Install system libs (libcairo2-dev libpng-dev libjpeg-dev libtiff-dev) and rerun.",
+          conditionMessage(e)
+        )
+      )
+    }
+  )
+  invisible(TRUE)
+}
+
+install_bitmap_support()
 
 # Default ExperimentHub cache under project root if user hasn't set one
 maybe_set_hub_cache <- function() {

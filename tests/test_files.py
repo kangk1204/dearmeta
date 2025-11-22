@@ -55,3 +55,13 @@ def test_relative_symlink(tmp_path: Path) -> None:
     files.relative_symlink(source, link)
     assert link.is_symlink()
     assert link.read_text() == "example"
+
+
+def test_ensure_subpath_blocks_escape(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    allowed = files.ensure_subpath(base, base / "child" / "file.txt")
+    assert allowed.as_posix().endswith("child/file.txt")
+
+    outside = Path("/tmp/escape.txt")
+    with pytest.raises(ValueError):
+        files.ensure_subpath(base, outside)
