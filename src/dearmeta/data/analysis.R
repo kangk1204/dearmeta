@@ -171,11 +171,12 @@ BIOLOGICAL_BATCH_PATTERNS <- c("tissue", "tumour", "tumor", "disease", "diagnosi
 BATCH_TARGET_MEDIAN_P <- 0.8  # [Leek2012]
 MIN_BATCH_NONMISSING_RATIO <- 0.5  # [Johnson2007]
 MIN_BATCH_LEVEL_SIZE <- 2L  # limma user guide §9
+MIN_BATCH_GROUP_BALANCE_COUNT <- 2L  # require >=2 per group/batch cell to reduce confounding
+GENE_LABEL_MAX_CHARS <- 40  # truncate overly long gene labels for plots
 
 DETECTION_P_THRESHOLD <- 0.01  # [Aryee2014]
 MAX_SAMPLE_DETP_FAILURE <- 0.05  # [Fortin2017]
 POOBAH_FAILURE_THRESHOLD <- 0.05  # [Zhou2018]
-MIN_BATCH_GROUP_BALANCE_COUNT <- 1L
 SESAME_SUPPORT_RESOURCES <- c("idatSignature")
 
 normalize_name <- function(x) {
@@ -1180,7 +1181,7 @@ generate_covariate_sets <- function(required_numeric, required_factor, optional_
   sets
 }
 
-build_batch_options <- function(metadata, group_col, manual_batches, candidate_batches, max_auto = 3) {
+build_batch_options <- function(metadata, group_col, manual_batches, candidate_batches, max_auto = 5) {
   manual <- unique(manual_batches)
   auto <- setdiff(candidate_batches, manual)
   logged_invalid <- character()
@@ -1632,6 +1633,7 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
       error = "All model configurations failed"
     ))
   }
+  warning_note <- NULL
   valid_models[, batch_target_ok := (is.na(batch_median_p_minfi) | batch_median_p_minfi >= BATCH_TARGET_MEDIAN_P) &
     (is.na(batch_median_p_sesame) | batch_median_p_sesame >= BATCH_TARGET_MEDIAN_P)]
   valid_models[, batch_ok_minfi := is.na(batch_median_p_minfi) | batch_median_p_minfi >= 0.2]
@@ -1647,8 +1649,21 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
   )]
   valid_models[, selected_batch_delta_minfi := ifelse(is.na(selected_batch_delta_minfi), -Inf, selected_batch_delta_minfi)]
   valid_models[, selected_batch_delta_sesame := ifelse(is.na(selected_batch_delta_sesame), -Inf, selected_batch_delta_sesame)]
+  selected_pool <- valid_models
+  if (any(valid_models$batch_target_ok, na.rm = TRUE)) {
+    selected_pool <- valid_models[batch_target_ok == TRUE]
+  } else {
+    warning_note <- "No model achieved batch target (median PCA p>=0.8); selecting best available configuration."
+    if (!is.null(log_fn)) {
+      log_fn("Warning: %s", warning_note)
+    }
+  }
+  if (nrow(selected_pool) == 0) {
+    selected_pool <- valid_models
+  }
+  candidate_models <- copy(selected_pool)
   setorder(
-    valid_models,
+    candidate_models,
     -batch_target_ok,
     -batch_ok,
     -n_sig_intersection,
@@ -1664,9 +1679,9 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
     n_covariates_total,
     n_surrogates
   )
-  valid_models[is.infinite(selected_batch_delta_minfi), selected_batch_delta_minfi := NA_real_]
-  valid_models[is.infinite(selected_batch_delta_sesame), selected_batch_delta_sesame := NA_real_]
-  best_row <- valid_models[1]
+  candidate_models[is.infinite(selected_batch_delta_minfi), selected_batch_delta_minfi := NA_real_]
+  candidate_models[is.infinite(selected_batch_delta_sesame), selected_batch_delta_sesame := NA_real_]
+  best_row <- candidate_models[1]
   idx_map <- vapply(configs, function(x) x$model_id, character(1))
   best_params <- configs[[match(best_row$model_id, idx_map)]]
   best_result <- execute_model_configuration(best_params, data_payload, opt, candidate_batches, log_fn = log_fn, keep_outputs = TRUE)
@@ -1699,7 +1714,8 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
     evaluated = evaluation_dt,
     covariate_sets = covariate_sets,
     covariate_stats = list(optional_numeric = stats_numeric, optional_factor = stats_factor),
-    batch_options = batch_options
+    batch_options = batch_options,
+    note = warning_note
   )
 }
 
@@ -4918,7 +4934,8 @@ design_selection_summary <- list(
   evaluated = model_evaluations,
   covariate_sets = design_optimisation$covariate_sets,
   covariate_stats = design_optimisation$covariate_stats,
-  batch_options = design_optimisation$batch_options
+  batch_options = design_optimisation$batch_options,
+  note = design_optimisation$note %||% NULL
 )
 
 model_evaluations_ranked <- NULL
@@ -5176,6 +5193,21 @@ annotations_clean[, gene_symbols := ucsc_refgene_name]
 annotations_clean[, gene_regions := ucsc_refgene_group]
 
 compose_gene_label <- function(gene_symbols, probe_ids) {
+  truncate_label <- function(labels, max_chars = GENE_LABEL_MAX_CHARS) {
+    if (length(labels) == 0) {
+      return(labels)
+    }
+    vapply(labels, function(lbl) {
+      if (is.na(lbl) || lbl == "") {
+        return(lbl)
+      }
+      if (nchar(lbl) > max_chars) {
+        paste0(substr(lbl, 1, max_chars - 3), "...")
+      } else {
+        lbl
+      }
+    }, character(1))
+  }
   if (is.null(gene_symbols)) gene_symbols <- character()
   if (is.null(probe_ids)) probe_ids <- character()
   len <- max(c(length(gene_symbols), length(probe_ids), 0L))
@@ -5194,7 +5226,7 @@ compose_gene_label <- function(gene_symbols, probe_ids) {
   labels[has_gene & !has_probe] <- genes[has_gene & !has_probe]
   labels[!(has_gene | has_probe)] <- ""
   labels[labels == ""] <- NA_character_
-  labels
+  truncate_label(labels)
 }
 
 select_top_label_rows <- function(df, label_col, adj_col = NULL, p_col = NULL, score_col = NULL, top_n = 10, prefer_high_score = FALSE) {
@@ -6973,7 +7005,8 @@ design_selection_export <- list(
   ranking = ranking_export,
   covariate_sets = covariate_sets_export,
   covariate_stats = covariate_stats_export,
-  batch_options = design_selection_summary$batch_options
+  batch_options = design_selection_summary$batch_options,
+  note = design_selection_summary$note %||% NULL
 )
 
 design_covariates <- list(
