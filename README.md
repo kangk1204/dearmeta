@@ -217,6 +217,7 @@ Again, confirm the `renv` library path in the R output.
    ```bash
    dearmeta download --gse GSE123456
    ```
+   > 다른 위치에 워크스페이스를 만들려면 `--workspace-root /path/to/GSE123456`를 download/analysis 모두에 추가하세요. 기본은 현재 작업 디렉터리 아래 `./GSE123456/`입니다.
 3. Open `GSE123456/configure.tsv` and fill the `dear_group` column with your biological groups.
    > `configure.tsv` now lives directly under the workspace root (e.g. `GSE123456/configure.tsv`). If you are reusing a workspace created by an older DearMeta version, you might still have `runtime/configure.tsv`; the CLI will warn and fall back to that file, but new runs always write next to the workspace root for easier editing.
 4. Launch the R analysis:

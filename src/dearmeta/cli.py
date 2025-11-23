@@ -14,6 +14,8 @@ import io
 
 import pandas as pd
 import typer
+import click
+from click.core import ParameterSource
 from rich.console import Console
 
 from .configure import (
@@ -49,6 +51,16 @@ def main_callback(verbose: bool = typer.Option(False, "--verbose", "-v", help="I
     """Global CLI options."""
     if verbose:
         logger.setLevel(logging.DEBUG)
+
+
+def _resolve_workspace_root(gse: str, workspace_root: Optional[Path]) -> Path:
+    """Resolve the workspace root path, defaulting to ./GSE123456."""
+    if workspace_root is None:
+        return (Path.cwd() / gse).resolve()
+    root = workspace_root.expanduser()
+    if not root.is_absolute():
+        root = (Path.cwd() / root).resolve()
+    return root
 
 
 def build_structure(root: Path) -> dict:
@@ -208,10 +220,13 @@ def download(
     gse: str = typer.Option(..., "--gse", help="GEO series accession (e.g. GSE123456)."),
     min_samples: int = typer.Option(6, help="Abort if fewer samples with IDAT pairs remain."),
     cache_dir: Path = typer.Option(Path(".dearmeta_cache"), help="Cache directory for GEO matrices."),
+    workspace_root: Optional[Path] = typer.Option(
+        None, "--workspace-root", help="Directory for the workspace/output (defaults to ./GSE123456)."
+    ),
 ) -> None:
     """Download GEO metadata and raw IDAT files, producing configure.tsv."""
     gse = validate_gse(gse)
-    root = Path.cwd() / gse
+    root = _resolve_workspace_root(gse, workspace_root)
     cache_dir = cache_dir.expanduser()
     if not cache_dir.is_absolute():
         cache_dir = (Path.cwd() / cache_dir).resolve()
@@ -363,6 +378,9 @@ def analysis(
         "auto",
         help="Cell composition reference ('auto', 'blood', or 'none'). Auto enables inference for blood datasets only.",
     ),
+    workspace_root: Optional[Path] = typer.Option(
+        None, "--workspace-root", help="Directory for the workspace/output (defaults to ./GSE123456)."
+    ),
 ) -> None:
     """Run the R-based analysis pipeline using prepared configure.tsv."""
     gse = validate_gse(gse)
@@ -378,7 +396,10 @@ def analysis(
     normalized_cell_ref = cell_comp_reference.strip().lower()
     if normalized_cell_ref not in valid_cell_refs:
         raise typer.BadParameter("--cell-comp-reference must be one of: auto, blood, none")
-    root = Path.cwd() / gse
+    ctx = click.get_current_context(silent=True)
+    fdr_source = ctx.get_parameter_source("fdr_threshold") if ctx is not None else None
+    fdr_explicit = fdr_source in (ParameterSource.COMMANDLINE, ParameterSource.ENVIRONMENT)
+    root = _resolve_workspace_root(gse, workspace_root)
     paths = build_structure(root)
     pipeline_log = paths["runtime"] / "pipeline.log"
     ensure_log_file_handler(logger, pipeline_log)
@@ -456,6 +477,7 @@ def analysis(
         env = {"DEARMETA_GROUPS_JSON": json.dumps(group_sizes.to_dict())}
         if normalized_group_ref:
             env["DEARMETA_GROUP_REFERENCE"] = normalized_group_ref
+        env["DEARMETA_FDR_EXPLICIT"] = "1" if fdr_explicit else "0"
         run_r_analysis(
             gse=gse,
             project_root=root,

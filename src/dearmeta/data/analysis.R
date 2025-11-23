@@ -54,6 +54,7 @@ missing_opts <- mandatory[!mandatory %in% names(opt) | vapply(opt[mandatory], is
 if (length(missing_opts) > 0) {
   stop("Missing required arguments: ", paste(missing_opts, collapse = ", "))
 }
+opt$fdr_provided <- tolower(Sys.getenv("DEARMETA_FDR_EXPLICIT", "false")) %in% c("1", "true", "yes", "on")
 
 ensure_required_packages <- function(pkgs) {
   missing <- character()
@@ -2044,15 +2045,20 @@ shared_probe_keys <- function(lhs, rhs) {
   merge(lhs_keys, rhs_keys, by = key_cols, all = FALSE, sort = FALSE)
 }
 
-filter_significant <- function(res, fdr, delta_thresh, p_thresh = 1) {
+filter_significant <- function(res, fdr, delta_thresh, p_thresh = 1, fdr_provided = TRUE) {
   dt <- as.data.table(res)
   if (!"adj.P.Val" %in% names(dt) || !"delta_beta" %in% names(dt)) {
     return(dt[0])
   }
-  mask <- dt$adj.P.Val <= fdr & abs(dt$delta_beta) >= delta_thresh
+  mask <- rep(TRUE, nrow(dt))
+  use_fdr <- isTRUE(fdr_provided) && is.finite(fdr) && fdr > 0 && fdr < Inf
+  if (use_fdr) {
+    mask <- mask & dt$adj.P.Val <= fdr
+  }
   if (!is.null(p_thresh) && is.finite(p_thresh) && p_thresh < 1 && "P.Value" %in% names(dt)) {
     mask <- mask & dt$P.Value <= p_thresh
   }
+  mask <- mask & abs(dt$delta_beta) >= delta_thresh
   dt[mask]
 }
 
@@ -4020,17 +4026,20 @@ platform_label <- platform_values[1]
 
 array_type_map <- list(
   EPICv1 = list(
-    dmr = "EPICv1",
+    dmr = "EPIC",
+    dmr_genome = "hg19",
     sesame_platform = "EPIC",
     sesame = c("EPIC.address", "EPIC.hg38.manifest", "EPIC.hg19.manifest")
   ),
   EPICv2 = list(
     dmr = "EPICv2",
+    dmr_genome = "hg38",
     sesame_platform = "EPICv2",
     sesame = c("EPICv2.address", "EPICv2.hg38.manifest", "EPICv2.hg19.manifest")
   ),
   HM450 = list(
     dmr = "450K",
+    dmr_genome = "hg19",
     sesame_platform = "HM450",
     sesame = c("HM450.address", "HM450.hg38.manifest", "HM450.hg19.manifest")
   )
@@ -4984,8 +4993,8 @@ if (!is.null(model_evaluations) && nrow(model_evaluations) > 0) {
   design_selection_summary$ranking <- model_evaluations_ranked
 }
 
-sig_minfi <- filter_significant(results_minfi, opt$fdr_threshold, opt$delta_beta_threshold, opt$p_threshold)
-sig_sesame <- filter_significant(results_sesame, opt$fdr_threshold, opt$delta_beta_threshold, opt$p_threshold)
+sig_minfi <- filter_significant(results_minfi, opt$fdr_threshold, opt$delta_beta_threshold, opt$p_threshold, opt$fdr_provided)
+sig_sesame <- filter_significant(results_sesame, opt$fdr_threshold, opt$delta_beta_threshold, opt$p_threshold, opt$fdr_provided)
 
 integrated <- merge_results(sig_minfi, sig_sesame)
 integrated$union <- limit_top_hits(integrated$union, opt$top_n_cpgs)
@@ -5007,7 +5016,33 @@ write_tsv_gz(integrated$union, file.path(analysis_dir, "cpg_union.tsv.gz"))
 
 # ---- DMRcate ----------------------------------------------------------------
 
-run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type, comparisons, sig_table) {
+resolve_dmrcate_coef <- function(coef_value, design) {
+  if (is.null(coef_value)) {
+    return(NULL)
+  }
+  if (is.character(coef_value)) {
+    matches <- which(colnames(design) == coef_value)
+    if (length(matches) == 0) {
+      log_message("DMRcate: coefficient %s not found in design; skipping.", coef_value)
+      return(NULL)
+    }
+    if (length(matches) > 1) {
+      log_message(
+        "DMRcate: coefficient %s matched multiple design columns (%s); using the first.",
+        coef_value,
+        paste(colnames(design)[matches], collapse = ", ")
+      )
+    }
+    return(as.integer(matches[1]))
+  }
+  if (is.numeric(coef_value) && length(coef_value) == 1 && !is.na(coef_value)) {
+    return(as.integer(coef_value))
+  }
+  log_message("DMRcate: unsupported coefficient type for %s; skipping.", as.character(coef_value)[1])
+  NULL
+}
+
+run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type, dmr_genome, comparisons, sig_table) {
   empty_result <- data.table(
     seqnames = character(),
     start = integer(),
@@ -5075,6 +5110,10 @@ run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type
         )
       }
     } else {
+      resolved_coef <- resolve_dmrcate_coef(contrast$coef, design)
+      if (is.null(resolved_coef)) {
+        next
+      }
       annotation <- tryCatch(
         cpg.annotate(
           object = M_matrix,
@@ -5083,7 +5122,7 @@ run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type
           arraytype = array_type,
           analysis.type = "differential",
           design = design,
-          coef = contrast$coef
+          coef = resolved_coef
         ),
         error = function(e) {
           log_message("DMRcate annotation failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
@@ -5102,7 +5141,7 @@ run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type
       next
     }
     dmr_ranges <- tryCatch(
-      as.data.table(as.data.frame(extractRanges(dmr_obj, genome = "hg38"))),
+      as.data.table(as.data.frame(extractRanges(dmr_obj, genome = dmr_genome))),
       error = function(e) {
         log_message("DMRcate range extraction failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
         NULL
@@ -5125,14 +5164,11 @@ run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type
 
 log_message("Running DMRcate...")
 array_type <- platform_info$dmr
-dmr_minfi <- run_dmrcate_for_pipeline("minfi", M_minfi_corrected, design_for_limma, array_type, group_comparisons, sig_minfi)
-write_tsv_gz(dmr_minfi, file.path(analysis_dir, "dmr_minfi.tsv.gz"))
-
-if (sesame_available && !is.null(M_sesame_corrected)) {
-  dmr_sesame <- run_dmrcate_for_pipeline("sesame", M_sesame_corrected, design_for_limma, array_type, group_comparisons, sig_sesame)
-  write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
-} else {
-  dmr_sesame <- data.table(
+dmr_genome <- platform_info$dmr_genome %||% "hg38"
+supported_array_types <- c("450K", "EPIC", "EPICv2", "27K")
+if (!(array_type %in% supported_array_types)) {
+  log_message("DMRcate skipped: unsupported array type %s (supported: %s)", array_type, paste(supported_array_types, collapse = ", "))
+  dmr_minfi <- data.table(
     seqnames = character(),
     start = integer(),
     end = integer(),
@@ -5143,7 +5179,30 @@ if (sesame_available && !is.null(M_sesame_corrected)) {
     reference_group = character(),
     target_group = character()
   )
+  write_tsv_gz(dmr_minfi, file.path(analysis_dir, "dmr_minfi.tsv.gz"))
+  dmr_sesame <- dmr_minfi
   write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
+} else {
+  dmr_minfi <- run_dmrcate_for_pipeline("minfi", M_minfi_corrected, design_for_limma, array_type, dmr_genome, group_comparisons, sig_minfi)
+  write_tsv_gz(dmr_minfi, file.path(analysis_dir, "dmr_minfi.tsv.gz"))
+
+  if (sesame_available && !is.null(M_sesame_corrected)) {
+    dmr_sesame <- run_dmrcate_for_pipeline("sesame", M_sesame_corrected, design_for_limma, array_type, dmr_genome, group_comparisons, sig_sesame)
+    write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
+  } else {
+    dmr_sesame <- data.table(
+      seqnames = character(),
+      start = integer(),
+      end = integer(),
+      width = integer(),
+      n.sites = integer(),
+      meanstat = numeric(),
+      comparison = character(),
+      reference_group = character(),
+      target_group = character()
+    )
+    write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
+  }
 }
 
 # ---- Annotation -------------------------------------------------------------
@@ -6084,10 +6143,6 @@ write_table_widget <- function(data, filename, title, subtitle = NULL, descripti
     }
     return(html_path)
   }
-  if (nrow(data) > 2000) {
-    log_message("Downsampling interactive table %s from %s to 2000 rows", title, nrow(data))
-    data <- head(data, 2000)
-  }
   use_buttons <- nrow(data) <= 1000
   widget_error <- NULL
   gene_col_targets <- which(names(data) %in% c("gene_symbols", "GeneSymbol", "GeneSymbol_cgid", "genesymbol_cgid")) - 1L
@@ -6115,7 +6170,7 @@ write_table_widget <- function(data, filename, title, subtitle = NULL, descripti
     data = as.data.frame(data),
     rownames = FALSE,
     filter = "top",
-    options = list(pageLength = 25, scrollX = TRUE, columnDefs = column_defs)
+    options = list(pageLength = 25, scrollX = TRUE, columnDefs = column_defs, deferRender = TRUE)
   )
   if (use_buttons) {
     dt_args$extensions <- "Buttons"
