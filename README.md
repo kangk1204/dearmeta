@@ -228,7 +228,7 @@ Again, confirm the `renv` library path in the R output.
    ```bash
    dearmeta analysis --gse GSE123456 --group-ref control
    ```
-   > `--group-ref` (alias `--group_ref`) is **required**. Supply a comma-separated, case-insensitive priority list (e.g., `control` or `control,MD`). The first group present becomes the control baseline; all other groups are treated as test.
+   > `--group-ref` (alias `--group_ref`) is **required**. Supply a comma-separated, case-insensitive priority list (e.g., `control` or `control,MD`). The first group present becomes the control baseline; all other groups are treated as test. Every contrast uses its own reference/target groups, and dashboards label them as “test vs control” accordingly.
 5. Reproduce this exact software stack:
    ```bash
    python -m pip install -r requirements.lock

@@ -3533,7 +3533,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
     htmltools::tags$div(
       class = "dm-comparison-roles",
       htmltools::tags$strong("Role assignment: "),
-      htmltools::tags$span(sprintf("Reference = %s (control); target = comparison group (test).", group_reference_resolved %||% "not set"))
+      htmltools::tags$span("Reference/test roles are shown per contrast (left = control, right = test).")
     ),
     htmltools::tags$ul(class = "dm-comparison-list", comparison_items)
   )
@@ -5070,6 +5070,7 @@ surrogate_vars <- best_outputs$surrogate_vars
 design_for_limma <- best_outputs$design_with_sv
 group_comparisons <- resolve_group_contrasts(design_for_limma, metadata_dt)
 if (!is.null(group_comparisons) && nrow(group_comparisons) > 0) {
+  # Assign roles per contrast: the reference_group of that contrast is control; the target_group is test.
   group_comparisons[, reference_role := "control"]
   group_comparisons[, target_role := "test"]
   group_comparisons[, baseline := group_reference_resolved]
@@ -5776,6 +5777,13 @@ annotate_results <- function(res) {
 annotated_minfi <- annotate_results(results_minfi)
 annotated_sesame <- annotate_results(results_sesame)
 annotated_intersection <- annotate_results(integrated$intersection)
+shared_keys_all <- shared_probe_keys(annotated_minfi, annotated_sesame)
+annotated_intersection_all <- if (nrow(shared_keys_all) > 0) {
+  key_cols_all <- names(shared_keys_all)
+  annotated_minfi[shared_keys_all, on = key_cols_all, nomatch = 0]
+} else {
+  data.table()
+}
 write_tsv_gz(annotated_minfi, file.path(analysis_dir, "annotated_cpg_minfi.tsv.gz"))
 write_tsv_gz(annotated_sesame, file.path(analysis_dir, "annotated_cpg_sesame.tsv.gz"))
 write_tsv_gz(annotated_intersection, file.path(analysis_dir, "annotated_cpg_intersection.tsv.gz"))
@@ -5875,6 +5883,12 @@ if (!is.null(annotated_intersection) && nrow(annotated_intersection) > 0 && !is.
   keep_idx <- annotated_intersection$probe_id %in% rownames(beta_intersection_heatmap)
   if (!all(keep_idx)) {
     annotated_intersection <- annotated_intersection[keep_idx]
+  }
+}
+if (!is.null(annotated_intersection_all) && nrow(annotated_intersection_all) > 0 && !is.null(beta_intersection_heatmap)) {
+  keep_idx_all <- annotated_intersection_all$probe_id %in% rownames(beta_intersection_heatmap)
+  if (!all(keep_idx_all)) {
+    annotated_intersection_all <- annotated_intersection_all[keep_idx_all]
   }
 }
 
@@ -6851,7 +6865,7 @@ volcano_sesame_classes <- paste(sprintf("%s(%s)", names(results_sesame), sapply(
 log_message("volcano_sesame columns: %s", volcano_sesame_classes)
 log_message("volcano_sesame rows: %s (finite adj.P.Val: %s)", nrow(results_sesame), sum(is.finite(results_sesame$adj.P.Val)))
 write_volcano_set(results_sesame, "Volcano sesame", file.path(fig_dir, "volcano_sesame"))
-write_volcano_set(integrated$intersection, "Volcano intersection", file.path(fig_dir, "volcano_intersection"))
+write_volcano_set(annotated_intersection_all, "Volcano intersection", file.path(fig_dir, "volcano_intersection"))
 
 density_plot <- function(beta_matrix, title) {
   df <- melt(as.data.table(beta_matrix, keep.rownames = "probe_id"), id.vars = "probe_id", variable.name = "sample", value.name = "beta")
@@ -6974,15 +6988,35 @@ manhattan_plot <- function(res, title) {
     return(ggplot() + theme_void() + labs(title = paste(title, sprintf("(%s)", reason))))
   }
   df <- prep$data
+  fdr_thr <- opt$fdr_threshold %||% NA_real_
+  delta_thr <- opt$delta_beta_threshold %||% NA_real_
+  p_thr <- opt$p_threshold %||% 1
+  sig_mask <- rep(FALSE, nrow(df))
+  if ("adj.p.val" %in% names(df) && "delta_beta" %in% names(df)) {
+    sig_mask <- (!is.na(df$adj.p.val) & df$adj.p.val <= fdr_thr) &
+      (is.finite(df$delta_beta) & abs(df$delta_beta) >= delta_thr)
+    if (!is.null(p_thr) && is.finite(p_thr) && p_thr < 1 && "p.value" %in% names(df)) {
+      sig_mask <- sig_mask & (!is.na(df$p.value) & df$p.value <= p_thr)
+    }
+  }
+  sig_n <- sum(sig_mask, na.rm = TRUE)
+  subtitle <- sprintf(
+    "Cutoff: FDR <= %.3g, |delta-beta| >= %.3g%s; significant CpGs: %s",
+    fdr_thr,
+    delta_thr,
+    if (!is.null(p_thr) && is.finite(p_thr) && p_thr < 1) sprintf(", p <= %.3g", p_thr) else "",
+    format(sig_n, big.mark = ",", scientific = FALSE)
+  )
   centers <- prep$centers
   label_df <- prep$label_df
   plot_manhattan <- ggplot(df, aes(x = index, y = neg_log10_p, color = factor(chr_num %% 2), text = tooltip)) +
-    geom_point(alpha = 0.6, size = 0.7) +
+    geom_point(data = df[!sig_mask], alpha = 0.6, size = 0.7, shape = 16) +
+    geom_point(data = df[sig_mask], alpha = 0.6, size = 0.7 * 1.3, shape = 22, stroke = 0.1) +
     scale_x_continuous(breaks = centers$center, labels = centers$chr_num) +
     scale_color_manual(values = c("#1f77b4", "#ff7f0e")) +
     theme_minimal() +
     theme(legend.position = "none") +
-    labs(title = title, x = "Chromosome", y = "-log10(p-value)")
+    labs(title = title, subtitle = subtitle, x = "Chromosome", y = "-log10(p-value)")
   if (nrow(label_df) > 0) {
     plot_manhattan <- plot_manhattan +
       ggrepel::geom_text_repel(
@@ -7005,9 +7039,30 @@ build_manhattan_plotly <- function(res, title) {
   }
   df <- prep$data
   label_df <- data.table::as.data.table(prep$label_df)
+  fdr_thr <- opt$fdr_threshold %||% NA_real_
+  delta_thr <- opt$delta_beta_threshold %||% NA_real_
+  p_thr <- opt$p_threshold %||% 1
+  sig_mask <- rep(FALSE, nrow(df))
+  if ("adj.p.val" %in% names(df) && "delta_beta" %in% names(df)) {
+    sig_mask <- (!is.na(df$adj.p.val) & df$adj.p.val <= fdr_thr) &
+      (is.finite(df$delta_beta) & abs(df$delta_beta) >= delta_thr)
+    if (!is.null(p_thr) && is.finite(p_thr) && p_thr < 1 && "p.value" %in% names(df)) {
+      sig_mask <- sig_mask & (!is.na(df$p.value) & df$p.value <= p_thr)
+    }
+  }
+  sig_n <- sum(sig_mask, na.rm = TRUE)
+  subtitle <- sprintf(
+    "Cutoff: FDR <= %.3g, |delta-beta| >= %.3g%s; significant CpGs: %s",
+    fdr_thr,
+    delta_thr,
+    if (!is.null(p_thr) && is.finite(p_thr) && p_thr < 1) sprintf(", p <= %.3g", p_thr) else "",
+    format(sig_n, big.mark = ",", scientific = FALSE)
+  )
   color_map <- c("0" = "#1f77b4", "1" = "#ff7f0e")
+  base_df <- df[!sig_mask]
+  sig_df <- df[sig_mask]
   plot_obj <- plotly::plot_ly(
-    df,
+    base_df,
     x = ~index,
     y = ~neg_log10_p,
     type = "scattergl",
@@ -7019,10 +7074,25 @@ build_manhattan_plotly <- function(res, title) {
     marker = list(size = 6, opacity = 0.6)
   ) %>%
     plotly::layout(
-      title = title,
+      title = list(text = sprintf("%s<br><sup>%s</sup>", title, subtitle)),
       xaxis = list(title = "Chromosome", tickmode = "array", tickvals = prep$centers$center, ticktext = prep$centers$chr_num),
       yaxis = list(title = "-log10(p-value)")
     )
+  if (nrow(sig_df) > 0) {
+    plot_obj <- plotly::add_trace(
+      plot_obj,
+      data = sig_df,
+      x = ~index,
+      y = ~neg_log10_p,
+      type = "scattergl",
+      mode = "markers",
+      color = ~factor(chr_num %% 2),
+      colors = color_map,
+      text = ~tooltip,
+      hoverinfo = "text",
+      marker = list(size = 6 * 1.3, opacity = 0.6, symbol = "square")
+    )
+  }
   if (nrow(label_df) > 0) {
     if (!"tooltip_label" %in% names(label_df)) {
       label_df[, tooltip_label := NA_character_]
@@ -7053,7 +7123,7 @@ build_manhattan_plotly <- function(res, title) {
 
 write_manhattan_set(annotated_minfi, "Manhattan minfi", file.path(fig_dir, "manhattan_minfi"))
 write_manhattan_set(annotated_sesame, "Manhattan sesame", file.path(fig_dir, "manhattan_sesame"))
-write_manhattan_set(annotated_intersection, "Manhattan intersection", file.path(fig_dir, "manhattan_intersection"))
+write_manhattan_set(annotated_intersection_all, "Manhattan intersection", file.path(fig_dir, "manhattan_intersection"))
 
 qq_plot <- function(res, title) {
   df <- as.data.frame(res)
@@ -7196,7 +7266,7 @@ if (!isTRUE(has_bitmap_device)) {
 
     heatmap_outputs_intersection <- create_top_cpg_heatmaps(
       beta_matrix = beta_intersection_heatmap,
-      annotated_results = annotated_intersection,
+      annotated_results = annotated_intersection_all,
       metadata = metadata_dt,
       fig_dir = fig_dir,
       interactive_dir = interactive_dir,
@@ -7347,7 +7417,7 @@ guard_interactive("volcano_minfi", {
 })
 guard_interactive("volcano_intersection", {
   plot_paths <- write_plotly_comparison_set(
-    integrated$intersection,
+    annotated_intersection_all,
     "volcano_intersection",
     "Volcano · intersection",
     build_volcano_plotly,
@@ -7367,7 +7437,7 @@ guard_interactive("manhattan_minfi", {
 })
 guard_interactive("manhattan_intersection", {
   plot_paths <- write_plotly_comparison_set(
-    annotated_intersection,
+    annotated_intersection_all,
     "manhattan_intersection",
     "Manhattan · intersection",
     build_manhattan_plotly,
@@ -7469,6 +7539,12 @@ if (sesame_available && nrow(results_sesame) > 0) {
       simplify_dmr_table(copy(annotated_dmr_sesame)),
       max_rows = 5000
     )
+    if (!is.null(table_data) && nrow(table_data) > 0) {
+      col_order <- c("comparison", setdiff(names(table_data), c("comparison", "probes")))
+      col_order <- c(col_order, if ("probes" %in% names(table_data)) "probes" else character())
+      existing <- intersect(col_order, names(table_data))
+      setcolorder(table_data, existing)
+    }
     path <- write_table_widget(
       table_data,
       file.path(interactive_dir, "table_dmr_sesame"),
@@ -7500,6 +7576,12 @@ guard_interactive("table_dmr_minfi", {
     simplify_dmr_table(copy(annotated_dmr_minfi)),
     max_rows = 5000
   )
+  if (!is.null(table_data) && nrow(table_data) > 0) {
+    col_order <- c("comparison", setdiff(names(table_data), c("comparison", "probes")))
+    col_order <- c(col_order, if ("probes" %in% names(table_data)) "probes" else character())
+    existing <- intersect(col_order, names(table_data))
+    setcolorder(table_data, existing)
+  }
   path <- write_table_widget(
     table_data,
     file.path(interactive_dir, "table_dmr_minfi"),
