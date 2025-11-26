@@ -226,9 +226,9 @@ Again, confirm the `renv` library path in the R output.
    > `configure.tsv` now lives directly under the workspace root (e.g. `GSE123456/configure.tsv`). If you are reusing a workspace created by an older DearMeta version, you might still have `runtime/configure.tsv`; the CLI will warn and fall back to that file, but new runs always write next to the workspace root for easier editing.
 4. Launch the R analysis:
    ```bash
-   dearmeta analysis --gse GSE123456
+   dearmeta analysis --gse GSE123456 --group-ref control
    ```
-   > Need a specific baseline? Append `--group-ref normoweight` (alias `--group_ref`) so limma treats that group as the reference when building contrasts. Otherwise the first `dear_group` in your configure file becomes the default reference.
+   > `--group-ref` (alias `--group_ref`) is **required**. Supply a comma-separated, case-insensitive priority list (e.g., `control` or `control,MD`). The first group present becomes the control baseline; all other groups are treated as test.
 5. Reproduce this exact software stack:
    ```bash
    python -m pip install -r requirements.lock
