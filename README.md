@@ -269,14 +269,14 @@ GSE123456/
 └── runtime/            # logs, run_config.json, pipeline artifacts
 ```
 
-### Choosing a reference group (`--group-ref`)
+### Choosing a reference group (`--group-ref`) — required
 - The `dear_group` column in `configure.tsv` tells DearMeta how samples cluster for differential testing; limma builds contrasts by comparing every group to a *reference* (baseline) group.
-- `--group-ref` accepts a **comma-separated priority list** (highest priority first) so multi-group designs work as expected. Examples:
-  - `--group-ref Control` → baseline Control, contrasts `Treated_vs_Control`, etc.
-  - `--group-ref Control,MD` with groups Control/MD/AD → contrasts `MD_vs_Control`, `AD_vs_Control`, and `AD_vs_MD` (MD used as reference for the AD vs MD comparison because it is higher priority).
-  - Missing entries are ignored; if nothing matches, DearMeta auto-detects control-like labels (`control`, `vehicle`, `baseline`, …) or falls back to the first group present.
-- If you omit `--group-ref`, the first non-empty `dear_group` value becomes the baseline, which might be arbitrary.
-- All volcano plots, top-table exports, and HTML dashboards label comparisons as `target_vs_reference`, making the direction of log-fold changes explicit.
+- `--group-ref` (alias `--group_ref`) is **mandatory**. It accepts a **comma-separated, case-insensitive priority list** (highest priority first). The first entry present in your data becomes the control; all other groups are treated as test.
+  - Examples:
+    - `--group-ref control` → baseline control; contrasts `treated_vs_control`, etc.
+    - `--group-ref control,MD` with groups control/MD/AD → contrasts `MD_vs_control`, `AD_vs_control`, and `AD_vs_MD` (MD used as control for the AD vs MD contrast because it is higher priority and present).
+  - Names not found in `dear_group` are ignored; execution stops if none of the supplied names are present.
+- Dashboards and plots label comparisons as “test vs control” using this reference to make the effect direction explicit and avoid sign flips.
 
 ## Tips & Troubleshooting
 - **Reusing downloads:** Copy `.dearmeta_cache/` from an existing machine to avoid re-downloading long-lived GEO artifacts.
