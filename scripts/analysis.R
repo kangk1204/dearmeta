@@ -11,7 +11,7 @@ suppressPackageStartupMessages({
   library(sesameData)
   library(limma)
   library(sva)
-  library(DMRcate)
+  library(dmrff)
   library(ggplot2)
   library(plotly)
   library(htmlwidgets)
@@ -85,6 +85,8 @@ log_message <- function(...) {
 log_message("DearMeta analysis launched for", opt$gse)
 
 # ---- Helper functions -------------------------------------------------------
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
 
 read_configure <- function(path, project_root) {
   lines <- readLines(path)
@@ -589,44 +591,143 @@ fwrite(results_sesame, file.path(analysis_dir, "dmp_sesame.tsv.gz"), sep = "\t",
 fwrite(integrated$intersection, file.path(analysis_dir, "cpg_intersection.tsv.gz"), sep = "\t", compress = "gzip")
 fwrite(integrated$union, file.path(analysis_dir, "cpg_union.tsv.gz"), sep = "\t", compress = "gzip")
 
-# ---- DMRcate ----------------------------------------------------------------
+# ---- DMRff ------------------------------------------------------------------
 
-log_message("Running DMRcate...")
-array_type <- platform_info$dmr
-if (nrow(sig_minfi) > 0) {
-  annotation <- cpg.annotate(
-    object = M_minfi_corrected,
-    datatype = "array",
-    what = "M",
-    arraytype = array_type,
-    analysis.type = "differential",
-    design = design_for_limma,
-    coef = "groupdear_group"
-  )
-  dmr_minfi <- dmrcate(annotation)
-  dmr_ranges <- extractRanges(dmr_minfi, genome = "hg38")
-} else {
-  log_message("Skipping DMRcate for minfi: no significant CpGs detected at FDR threshold.")
-  dmr_ranges <- data.frame(seqnames = character(), start = integer(), end = integer(), width = integer(), n.sites = integer(), meanstat = numeric())
+dmrff_empty <- data.table(
+  chr = character(),
+  start = integer(),
+  end = integer(),
+  n = integer(),
+  start.idx = integer(),
+  end.idx = integer(),
+  start.orig = integer(),
+  end.orig = integer(),
+  z.orig = numeric(),
+  p.orig = numeric(),
+  B = numeric(),
+  S = numeric(),
+  estimate = numeric(),
+  se = numeric(),
+  z = numeric(),
+  p.value = numeric(),
+  number.tests = numeric(),
+  p.adjust = numeric(),
+  comparison = character(),
+  reference_group = character(),
+  target_group = character()
+)
+
+dmrff_annotation <- function(MSet) {
+  anno_df <- tryCatch(as.data.frame(getAnnotation(MSet)), error = function(e) {
+    log_message("dmrff: failed to load annotation: %s", conditionMessage(e))
+    NULL
+  })
+  if (is.null(anno_df) || nrow(anno_df) == 0) {
+    return(NULL)
+  }
+  probe_id <- rownames(anno_df)
+  pick <- function(cols) {
+    for (col in cols) {
+      if (col %in% names(anno_df)) {
+        return(anno_df[[col]])
+      }
+    }
+    NULL
+  }
+  chr <- pick(c("chr", "chromosome", "seqnames"))
+  pos <- pick(c("mapinfo", "pos", "position"))
+  if (is.null(chr) || is.null(pos)) {
+    return(NULL)
+  }
+  data.table(probe_id = probe_id, chr = as.character(chr), pos = as.numeric(pos))
 }
-fwrite(as.data.frame(dmr_ranges), file.path(analysis_dir, "dmr_minfi.tsv.gz"), sep = "\t", compress = "gzip")
+
+run_dmrff_simple <- function(results_dt, M_matrix, annotation_dt, comparison_label, reference_group, target_group, p_cutoff = 0.05) {
+  if (is.null(results_dt) || nrow(results_dt) == 0) {
+    log_message("dmrff: skipping %s (no CpG stats).", comparison_label)
+    return(copy(dmrff_empty))
+  }
+  if (is.null(annotation_dt) || nrow(annotation_dt) == 0) {
+    log_message("dmrff: skipping %s (missing annotation).", comparison_label)
+    return(copy(dmrff_empty))
+  }
+  if (is.null(M_matrix) || length(M_matrix) == 0) {
+    log_message("dmrff: skipping %s (missing methylation matrix).", comparison_label)
+    return(copy(dmrff_empty))
+  }
+  dt <- copy(results_dt)
+  if (!all(c("logFC", "t", "P.Value", "probe_id") %in% names(dt))) {
+    log_message("dmrff: skipping %s (missing logFC/t/P.Value).", comparison_label)
+    return(copy(dmrff_empty))
+  }
+  dt[, se := ifelse(is.finite(t) & t != 0, abs(logFC / t), NA_real_)]
+  dt <- dt[is.finite(se) & is.finite(P.Value) & !is.na(probe_id)]
+  if (nrow(dt) == 0) {
+    log_message("dmrff: skipping %s (no finite statistics).", comparison_label)
+    return(copy(dmrff_empty))
+  }
+  ann <- annotation_dt[probe_id %chin% dt$probe_id & !is.na(chr) & !is.na(pos)]
+  if (nrow(ann) == 0) {
+    log_message("dmrff: skipping %s (no overlap with annotation).", comparison_label)
+    return(copy(dmrff_empty))
+  }
+  dt <- dt[probe_id %chin% ann$probe_id]
+  ann <- ann[match(dt$probe_id, ann$probe_id)]
+  meth_rows <- dt$probe_id
+  available <- meth_rows[meth_rows %in% rownames(M_matrix)]
+  if (length(available) == 0) {
+    log_message("dmrff: skipping %s (no CpGs found in methylation matrix).", comparison_label)
+    return(copy(dmrff_empty))
+  }
+  keep <- meth_rows %chin% available
+  dt <- dt[keep]
+  ann <- ann[keep]
+  meth_matrix <- tryCatch(as.matrix(M_matrix[dt$probe_id, , drop = FALSE]), error = function(e) {
+    log_message("dmrff: failed to subset methylation matrix for %s: %s", comparison_label, conditionMessage(e))
+    NULL
+  })
+  if (is.null(meth_matrix)) {
+    return(copy(dmrff_empty))
+  }
+  dmr_res <- tryCatch(
+    dmrff::dmrff(
+      estimate = dt$logFC,
+      se = dt$se,
+      p.value = dt$P.Value,
+      methylation = meth_matrix,
+      chr = ann$chr,
+      pos = ann$pos,
+      p.cutoff = min(p_cutoff, 0.05),
+      maxgap = 500,
+      verbose = TRUE
+    ),
+    error = function(e) {
+      log_message("dmrff: failed for %s: %s", comparison_label, conditionMessage(e))
+      NULL
+    }
+  )
+  if (is.null(dmr_res) || nrow(dmr_res) == 0) {
+    return(copy(dmrff_empty))
+  }
+  out <- as.data.table(dmr_res)
+  out[, comparison := comparison_label]
+  out[, reference_group := reference_group %||% ""]
+  out[, target_group := target_group %||% ""]
+  out
+}
+
+log_message("Running dmrff...")
+group_levels <- levels(factor(metadata_dt$dear_group))
+comparison_label <- if (length(group_levels) >= 2) sprintf("%s_vs_%s", group_levels[2], group_levels[1]) else "dear_group"
+dmr_annotation <- dmrff_annotation(MSet)
+dmr_minfi <- run_dmrff_simple(results_minfi, M_minfi_corrected, dmr_annotation, comparison_label, group_levels[1] %||% NA_character_, group_levels[2] %||% NA_character_)
+fwrite(dmr_minfi, file.path(analysis_dir, "dmr_minfi.tsv.gz"), sep = "\t", compress = "gzip")
 
 if (sesame_available && !is.null(M_sesame_corrected)) {
-  annotation_sesame <- cpg.annotate(
-    object = M_sesame_corrected,
-    datatype = "array",
-    what = "M",
-    arraytype = array_type,
-    analysis.type = "differential",
-    design = design_for_limma,
-    coef = "groupdear_group"
-  )
-  dmr_sesame <- dmrcate(annotation_sesame)
-  dmr_ranges_sesame <- extractRanges(dmr_sesame, genome = "hg38")
-  fwrite(as.data.frame(dmr_ranges_sesame), file.path(analysis_dir, "dmr_sesame.tsv.gz"), sep = "\t", compress = "gzip")
+  dmr_sesame <- run_dmrff_simple(results_sesame, M_sesame_corrected, dmr_annotation, comparison_label, group_levels[1] %||% NA_character_, group_levels[2] %||% NA_character_)
+  fwrite(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"), sep = "\t", compress = "gzip")
 } else {
-  dmr_ranges_sesame <- data.frame(seqnames = character(), start = integer(), end = integer(), width = integer(), n.sites = integer(), meanstat = numeric())
-  fwrite(dmr_ranges_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"), sep = "\t", compress = "gzip")
+  fwrite(dmrff_empty, file.path(analysis_dir, "dmr_sesame.tsv.gz"), sep = "\t", compress = "gzip")
 }
 
 # ---- Annotation -------------------------------------------------------------

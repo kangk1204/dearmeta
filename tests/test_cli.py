@@ -36,6 +36,8 @@ def test_analysis_forwards_min_group_size(tmp_path, monkeypatch):
             gse,
             "--min-group-size",
             "5",
+            "--group-ref",
+            "A",
         ],
     )
     assert result.exit_code == 0

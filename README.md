@@ -9,6 +9,11 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
 - Run an opinionated R analysis pipeline (`src/dearmeta/data/analysis.R`) to produce QC plots, differential methylation tables, and HTML reports.
 - Preserve run configurations (`configure.tsv` in each workspace root) and logs for reproducibility.
 
+## DMR & Enrichment at a Glance
+- DMRs are called with **dmrff** (450K/EPIC/EPICv2). Full results are saved; the dashboard shows only the top intersected DMRs (default 10,000). Tune with `--dmr-intersection-top`.
+- Enrichment uses **fgsea** + cached MSigDB C2/C5/Reactome gene sets (downloaded to `.dearmeta_cache/msigdb` on install); runs offline once cached.
+- g:Profiler is no longer used; internet hiccups won’t break enrichment after the first cache.
+
 ## Prerequisites
 
 | Requirement | Details |
@@ -76,7 +81,7 @@ DEARMETA is a command-line toolkit that downloads, preprocesses, and analyses Il
    ```bash
    bash scripts/bootstrap.sh
    ```
-   Grab a coffee; the first run downloads Bioconductor + sesame data (HM450/EPIC/EPICv2) and tries to install bitmap devices (Cairo/ragg) for interactive plots. If Cairo fails, install `libcairo2-dev libpng-dev libjpeg-dev libtiff-dev` and rerun.
+   Grab a coffee; the first run downloads Bioconductor + sesame data (HM450/EPIC/EPICv2) and caches MSigDB gene sets for fgsea enrichment.
 6. Verify:
    ```bash
    dearmeta --help
@@ -94,8 +99,7 @@ That’s it—you now have a reproducible DearMeta install. The detailed section
 sudo apt-get update
 sudo apt-get install -y build-essential python3-venv python3-pip \
   libcurl4-openssl-dev libxml2-dev libssl-dev \
-  libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev \
-  libcairo2-dev
+  libpng-dev libjpeg-dev libtiff-dev libhdf5-dev zlib1g-dev libbz2-dev liblzma-dev
 ```
 These headers are required for CRAN/Bioconductor packages (`xml2`, `png`, `rhdf5`, `Rsamtools`, …). Run the same commands inside Ubuntu WSL if you are on Windows.
 

@@ -11,10 +11,9 @@ suppressPackageStartupMessages({
   library(sesameData)
   library(limma)
   library(sva)
-  library(DMRcate)
+  library(dmrff)
   library(ggplot2)
   library(ggrepel)
-  library(gprofiler2)
   library(plotly)
   library(htmlwidgets)
   library(htmltools)
@@ -44,7 +43,8 @@ option_list <- list(
   make_option("--top-n-cpgs", type = "integer", dest = "top_n_cpgs", default = 10000, help = "Number of CpGs to retain for plots/tables"),
   make_option("--poobah-threshold", type = "double", dest = "poobah_threshold", default = 0.05, help = "Sesame pOOBAH failure threshold."),
   make_option("--drop-sesame-failed", action = "store_true", dest = "drop_sesame_failed", default = FALSE, help = "Drop samples exceeding the sesame pOOBAH threshold."),
-  make_option("--cell-comp-reference", type = "character", dest = "cell_comp_reference", default = "auto", help = "Cell composition reference (auto, blood, none).")
+  make_option("--cell-comp-reference", type = "character", dest = "cell_comp_reference", default = "auto", help = "Cell composition reference (auto, blood, none)."),
+  make_option("--dmr-intersection-top", type = "integer", dest = "dmr_intersection_top", default = 10000, help = "Number of intersected DMRs to retain for dashboard/interactive outputs.")
 )
 
 opt <- parse_args(OptionParser(option_list = option_list))
@@ -75,8 +75,8 @@ ensure_required_packages <- function(pkgs) {
 
 ensure_required_packages(c(
   "optparse", "jsonlite", "data.table", "minfi", "sesame", "sesameData", "limma", "sva",
-  "DMRcate", "ggplot2", "ggrepel", "plotly", "htmlwidgets", "DT", "RColorBrewer",
-  "VennDiagram", "gprofiler2"
+  "dmrff", "fgsea", "msigdbr", "ggplot2", "ggrepel", "plotly", "htmlwidgets", "DT", "RColorBrewer",
+  "VennDiagram"
 ))
 
 if (is.null(opt$top_n_cpgs) || length(opt$top_n_cpgs) == 0) {
@@ -721,7 +721,17 @@ resolve_group_levels <- function(values) {
   }
   priority <- unique(trimws(group_reference_priority))
   priority <- priority[priority != ""]
-  matched <- priority[priority %in% levels_vec]
+  # case-insensitive match of priority to available levels
+  matched <- character()
+  if (length(priority) > 0) {
+    for (p in priority) {
+      hit <- levels_vec[tolower(levels_vec) == tolower(p)]
+      if (length(hit) > 0) {
+        matched <- c(matched, hit[1])
+      }
+    }
+    matched <- unique(matched)
+  }
   if (length(matched) == 0) {
     control_like <- c("control", "ctrl", "vehicle", "baseline", "normal", "healthy", "wt", "wildtype", "untreated", "placebo")
     norm_levels <- normalize_name(levels_vec)
@@ -730,9 +740,10 @@ resolve_group_levels <- function(values) {
       matched <- ctrl_match[1]
     }
   }
-  reference <- if (length(matched) > 0) matched[1] else levels_vec[1]
+  reference <- if (length(matched) > 0) matched[1] else NA_character_
   remaining_priority <- setdiff(matched, reference)
   remaining_levels <- setdiff(levels_vec, c(reference, remaining_priority))
+  remaining_levels <- remaining_levels[order(tolower(remaining_levels), remaining_levels)]
   ordered_levels <- c(reference, remaining_priority, remaining_levels)
   list(levels = ordered_levels, reference = reference)
 }
@@ -2236,6 +2247,20 @@ create_top_cpg_heatmaps <- function(beta_matrix, annotated_results, metadata, fi
   }
   top_cap <- max(1, as.integer(top_n %||% 100))
   for (cmp in comparisons) {
+    cmp_groups <- unique(unlist(strsplit(cmp, "_vs_", fixed = TRUE)))
+    cmp_groups <- cmp_groups[nzchar(cmp_groups)]
+    sample_filter <- if (length(cmp_groups) >= 2) {
+      sample_meta$dear_group %in% cmp_groups
+    } else {
+      rep(TRUE, nrow(sample_meta))
+    }
+    if (!any(sample_filter)) {
+      log_message("Skipping top CpG heatmap for %s (%s): no samples in comparison groups", cmp, pipeline_label)
+      next
+    }
+    sample_meta_cmp <- sample_meta[sample_filter]
+    beta_cmp <- beta_matrix[, sample_filter, drop = FALSE]
+    sample_ids_cmp <- sample_meta_cmp$colname
     res_cmp <- if (cmp == "overall") annotated_results else annotated_results[comparison == cmp]
     if (nrow(res_cmp) == 0) {
       next
@@ -2255,7 +2280,7 @@ create_top_cpg_heatmaps <- function(beta_matrix, annotated_results, metadata, fi
       next
     }
     top_probes <- head(probes, top_cap)
-    beta_sub <- beta_matrix[top_probes, sample_ids, drop = FALSE]
+    beta_sub <- beta_cmp[top_probes, sample_ids_cmp, drop = FALSE]
     if (!is.matrix(beta_sub)) {
       beta_sub <- as.matrix(beta_sub)
     }
@@ -2295,14 +2320,14 @@ create_top_cpg_heatmaps <- function(beta_matrix, annotated_results, metadata, fi
       }
       ordering
     }
-    group_vec <- sample_meta$dear_group
+    group_vec <- sample_meta_cmp$dear_group
     col_order <- reorder_by_group(z_mat, group_vec)
     if (length(col_order) == 0) {
       col_order <- seq_len(ncol(z_mat))
     }
     z_ordered <- z_mat[row_order, col_order, drop = FALSE]
     row_labels_ordered <- row_labels[row_order]
-    sample_ordered <- sample_ids[col_order]
+    sample_ordered <- sample_ids_cmp[col_order]
     sample_groups <- group_vec[col_order]
     sample_labels <- paste0(sample_ordered, "\n", sample_groups)
     label_map <- setNames(sample_labels, sample_ordered)
@@ -2401,13 +2426,28 @@ format_identifier_title <- function(identifier) {
   if (is.null(identifier) || !nzchar(identifier)) {
     return("DearMeta Interactive")
   }
+  role_map <- getOption("dearmeta.comparison_roles")
+  role_suffix <- NULL
+  if (!is.null(role_map) && is.character(identifier) && length(identifier) == 1 && identifier %in% names(role_map)) {
+    mapped <- role_map[[identifier]]
+    if (!is.null(mapped) && nzchar(mapped)) {
+      role_suffix <- paste0("[", mapped, "]")
+    }
+  }
+  group_roles_opt <- getOption("dearmeta.group_roles")
+  if (is.null(role_suffix) && !is.null(group_roles_opt) && is.character(identifier) && length(identifier) == 1 && identifier %in% names(group_roles_opt)) {
+    mapped <- group_roles_opt[[identifier]]
+    if (!is.null(mapped) && nzchar(mapped)) {
+      role_suffix <- paste0("[", mapped, "]")
+    }
+  }
   cleaned <- gsub("[^[:alnum:]]+", " ", identifier)
   parts <- unlist(strsplit(cleaned, "\\s+"))
   parts <- parts[parts != ""]
   if (length(parts) == 0) {
     return("DearMeta Interactive")
   }
-  paste(
+  title_core <- paste(
     vapply(
       parts,
       function(word) {
@@ -2426,6 +2466,10 @@ format_identifier_title <- function(identifier) {
     ),
     collapse = " "
   )
+  if (!is.null(role_suffix)) {
+    return(paste(title_core, role_suffix))
+  }
+  title_core
 }
 
 default_widget_subtitle <- function(widget) {
@@ -2620,6 +2664,27 @@ interactive_output_metadata <- function(key) {
       description = "Annotated CpGs that are shared between pipelines after filtering.",
       category = "Annotated Tables",
       icon = "TB"
+    ),
+    table_dmr_minfi = list(
+      title = "Annotated DMRs · minfi",
+      subtitle = "dmrff-derived regions with overlapping probe and gene context (minfi pipeline).",
+      description = "Filter by chromosome, comparison, adjusted p-value, or gene fields; export for downstream validation.",
+      category = "Annotated DMRs",
+      icon = "DMR"
+    ),
+    table_dmr_sesame = list(
+      title = "Annotated DMRs · sesame",
+      subtitle = "dmrff-derived regions with overlapping probe and gene context (sesame pipeline).",
+      description = "Filter by chromosome, comparison, adjusted p-value, or gene fields; export for downstream validation.",
+      category = "Annotated DMRs",
+      icon = "DMR"
+    ),
+    table_dmr_intersection = list(
+      title = "Annotated DMRs · intersection",
+      subtitle = "Overlapping dmrff regions across minfi and sesame with merged probe/gene context.",
+      description = "Shared regions derived from overlapping minfi and sesame DMRs; inspect combined probes and genes.",
+      category = "Annotated DMRs",
+      icon = "DMR"
     ),
     table_intersection_dual = list(
       title = "Shared CpGs · dual pipeline view",
@@ -3317,6 +3382,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
         )
       }
       list(
+        key = key,
         category = meta$category,
         card = htmltools::tags$a(
           class = "dm-link-card",
@@ -3337,12 +3403,79 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
       categories <- split(entries, vapply(entries, function(item) item$category %||% "Additional Outputs", character(1)))
       batch_covariate_cards <- categories[["Batch & Covariates"]] %||% list()
       categories[["Batch & Covariates"]] <- NULL
-      category_order <- c("Quality Control", "Differential Analysis", "Genomic Context", "Annotated Tables", "Additional Outputs")
+      parse_plot_key <- function(key, type) {
+        if (type == "Heatmaps") {
+          rest <- sub("^heatmap_top_cpgs_", "", key)
+        } else if (type == "Manhattan") {
+          rest <- sub("^manhattan_", "", key)
+        } else if (type == "Volcano") {
+          rest <- sub("^volcano_", "", key)
+        } else {
+          return(NULL)
+        }
+        parts <- strsplit(rest, "_", fixed = TRUE)[[1]]
+        if (length(parts) < 2) return(NULL)
+        pipeline <- parts[1]
+        comparison <- if (length(parts) > 1) paste(parts[-1], collapse = "_") else ""
+        list(pipeline = pipeline, comparison = comparison)
+      }
+      build_comparison_grid <- function(items, title) {
+        parsed <- lapply(items, function(item) {
+          key <- item$key %||% ""
+          plot_type <- if (grepl("^heatmap_top_cpgs_", key)) "Heatmaps" else if (grepl("^manhattan_", key)) "Manhattan" else if (grepl("^volcano_", key)) "Volcano" else NULL
+          if (is.null(plot_type)) return(NULL)
+          info <- parse_plot_key(key, plot_type)
+          if (is.null(info)) return(NULL)
+          list(
+            comparison = info$comparison,
+            pipeline = info$pipeline,
+            card = item$card
+          )
+        })
+        parsed <- Filter(Negate(is.null), parsed)
+        if (length(parsed) == 0) return(NULL)
+        pipeline_labels <- c(intersection = "Intersection", minfi = "Minfi", sesame = "Sesame")
+        comps <- split(parsed, vapply(parsed, function(x) x$comparison %||% "", character(1)))
+        comp_order <- sort(unique(names(comps)))
+        header <- htmltools::tags$div(
+          class = "dm-comparison-grid__row dm-comparison-grid__header",
+          htmltools::tags$div(class = "dm-comparison-grid__cell dm-comparison-grid__cell--label", "Comparison"),
+          lapply(pipeline_labels, function(lbl) htmltools::tags$div(class = "dm-comparison-grid__cell dm-comparison-grid__cell--head", lbl))
+        )
+        rows <- lapply(comp_order, function(comp) {
+          entries_for_comp <- comps[[comp]]
+          cells <- lapply(names(pipeline_labels), function(pipe) {
+            match <- Filter(function(x) identical(x$pipeline, pipe), entries_for_comp)
+            cell_node <- if (length(match) > 0) match[[1]]$card else htmltools::tags$span(class = "dm-empty-note", "\u2013")
+            htmltools::tags$div(class = "dm-comparison-grid__cell", cell_node)
+          })
+          htmltools::tags$div(
+            class = "dm-comparison-grid__row",
+            htmltools::tags$div(class = "dm-comparison-grid__cell dm-comparison-grid__cell--label", format_identifier_title(comp)),
+            cells
+          )
+        })
+        htmltools::tags$div(
+          class = "dm-interactive-group",
+          htmltools::tags$h3(class = "dm-interactive-group__title", title),
+          htmltools::tags$div(class = "dm-comparison-grid", c(list(header), rows))
+        )
+      }
+      category_order <- c(
+        "Quality Control", "Heatmaps", "Volcano", "Manhattan",
+        "Differential Analysis", "Genomic Context", "Annotated Tables", "Additional Outputs"
+      )
       ordered_names <- names(categories)[order(match(names(categories), category_order, nomatch = length(category_order) + 1))]
       interactive_sections <- lapply(ordered_names, function(name) {
         cards <- lapply(categories[[name]], function(item) item$card)
         if (length(cards) == 0) {
           return(NULL)
+        }
+        if (name %in% c("Heatmaps", "Manhattan", "Volcano")) {
+          custom <- build_comparison_grid(categories[[name]], name)
+          if (!is.null(custom)) {
+            return(custom)
+          }
         }
         htmltools::tags$div(
           class = "dm-interactive-group",
@@ -3369,12 +3502,14 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
   comparison_section <- NULL
   comparisons <- summary$comparisons %||% list()
   if (length(comparisons) > 0) {
-    comparison_items <- lapply(seq_along(comparisons), function(i) {
-      item <- comparisons[[i]]
-      tgt <- item$target_group %||% item$target %||% "Target"
-      ref <- item$reference_group %||% item$reference %||% "Reference"
-      label <- item$comparison %||% sprintf("%s_vs_%s", tgt, ref)
-      contrast <- item$contrast_formula %||% item$coef %||% ""
+  comparison_items <- lapply(seq_along(comparisons), function(i) {
+    item <- comparisons[[i]]
+    tgt <- item$target_group %||% item$target %||% "Target"
+    ref <- item$reference_group %||% item$reference %||% "Reference"
+    ref_role <- item$reference_role %||% "control"
+    tgt_role <- item$target_role %||% "test"
+    label <- item$comparison %||% sprintf("%s_vs_%s", tgt, ref)
+    contrast <- item$contrast_formula %||% item$coef %||% ""
       htmltools::tags$li(
         class = "dm-comparison-item",
         htmltools::tags$div(
@@ -3383,18 +3518,26 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
           htmltools::tags$div(
             class = "dm-comparison-item__labels",
             htmltools::tags$span(class = "dm-comparison-item__title", format_identifier_title(label)),
-            htmltools::tags$span(class = "dm-comparison-item__subtitle", sprintf("%s \u2192 %s", ref, tgt))
+            htmltools::tags$span(
+              class = "dm-comparison-item__subtitle",
+              sprintf("%s (control) \u2192 %s (test)", ref, tgt)
+            )
           )
         ),
         if (nzchar(contrast)) htmltools::tags$span(class = "dm-comparison-item__meta", contrast)
       )
     })
-    comparison_section <- htmltools::tags$section(
-      class = "dm-section",
-      htmltools::tags$h2(class = "dm-section__title", "Group comparisons"),
-      htmltools::tags$ul(class = "dm-comparison-list", comparison_items)
-    )
-  }
+  comparison_section <- htmltools::tags$section(
+    class = "dm-section",
+    htmltools::tags$h2(class = "dm-section__title", "Group comparisons"),
+    htmltools::tags$div(
+      class = "dm-comparison-roles",
+      htmltools::tags$strong("Role assignment: "),
+      htmltools::tags$span(sprintf("Reference = %s (control); target = comparison group (test).", group_reference_resolved %||% "not set"))
+    ),
+    htmltools::tags$ul(class = "dm-comparison-list", comparison_items)
+  )
+}
 
   batch_covariate_section <- NULL
   if (length(batch_covariate_cards) > 0) {
@@ -3787,6 +3930,39 @@ a { color: inherit; text-decoration: none; }
   flex-direction: column;
   gap: 8px;
 }
+.dm-comparison-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+.dm-comparison-grid__row {
+  display: grid;
+  grid-template-columns: 1.2fr repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+.dm-comparison-grid__header {
+  font-size: 0.92rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(148, 163, 184, 0.85);
+}
+.dm-comparison-grid__cell {
+  min-height: 100%;
+}
+.dm-comparison-grid__cell--label {
+  display: flex;
+  align-items: center;
+  font-weight: 600;
+  color: #E2E8F0;
+  padding-left: 6px;
+}
+.dm-comparison-grid__cell--head {
+  display: flex;
+  align-items: center;
+  color: rgba(226, 232, 240, 0.9);
+}
 .dm-link-card__title {
   margin: 0;
   font-size: 1.05rem;
@@ -3987,28 +4163,41 @@ if (!is.null(opt$group_ref) && nzchar(trimws(opt$group_ref))) {
   }
   group_reference_priority <<- priority
   unique_groups <- unique(config$dear_group)
-  matched <- priority[priority %in% unique_groups]
+  matched <- unique_groups[tolower(unique_groups) %in% tolower(priority)]
   if (length(matched) == 0) {
-    log_message(
-      "None of the requested --group-ref priorities are present (%s); will auto-detect reference.",
-      paste(priority, collapse = ", ")
-    )
-  } else {
-    log_message(
-      "Group reference priority: %s (present: %s)",
-      paste(priority, collapse = ", "),
-      paste(matched, collapse = ", ")
-    )
+    stop("--group-ref provided but none of the specified groups are present in dear_group: ", paste(priority, collapse = ", "))
   }
+  log_message(
+    "Group reference priority (case-insensitive): %s (matched: %s)",
+    paste(priority, collapse = ", "),
+    paste(matched, collapse = ", ")
+  )
   resolved <- resolve_group_levels(unique_groups)
   group_reference_resolved <<- resolved$reference
   log_message("Using %s as the initial reference group for contrasts.", group_reference_resolved)
 } else {
-  group_reference_priority <<- character()
-  group_reference_resolved <<- NA_character_
+  stop("You must provide --group-ref (comma-separated) to pin the reference group.")
 }
 
 ensure_reference_group_present(group_counts)
+
+if (!is.null(group_reference_resolved) && !is.na(group_reference_resolved)) {
+  if (!group_reference_resolved %chin% config$dear_group) {
+    stop("Reference group ", group_reference_resolved, " not present after QC.")
+  }
+}
+
+config$group_role <- ifelse(config$dear_group == group_reference_resolved, "con", "test")
+group_levels <- resolve_group_levels(config$dear_group)$levels
+role_table <- data.table(
+  group = group_levels,
+  role = ifelse(group_levels == group_reference_resolved, "con", "test")
+)
+log_message(
+  "Contrast roles: reference (con) = %s; other groups (test, alphabetical) = %s",
+  group_reference_resolved,
+  paste(role_table[role == "test"]$group, collapse = ", ")
+)
 
 log_message("Loaded", nrow(config), "samples for analysis across groups:", paste(names(group_counts), group_counts, sep = "=", collapse = "; "))
 
@@ -4880,6 +5069,20 @@ design_without_sv <- best_outputs$design_base
 surrogate_vars <- best_outputs$surrogate_vars
 design_for_limma <- best_outputs$design_with_sv
 group_comparisons <- resolve_group_contrasts(design_for_limma, metadata_dt)
+if (!is.null(group_comparisons) && nrow(group_comparisons) > 0) {
+  group_comparisons[, reference_role := "control"]
+  group_comparisons[, target_role := "test"]
+  group_comparisons[, baseline := group_reference_resolved]
+  comparison_role_map <- setNames(
+    sprintf("%s (test) vs %s (control)", group_comparisons$target_group, group_comparisons$reference_group),
+    group_comparisons$comparison
+  )
+  options(dearmeta.comparison_roles = comparison_role_map)
+}
+if (!is.null(group_levels) && length(group_levels) > 0) {
+  grp_role_map <- setNames(ifelse(group_levels == group_reference_resolved, "con", "test"), group_levels)
+  options(dearmeta.group_roles = grp_role_map)
+}
 
 M_minfi_corrected <- best_outputs$M_minfi
 beta_minfi <- best_outputs$beta_minfi
@@ -5014,146 +5217,173 @@ write_tsv_gz(results_sesame, file.path(analysis_dir, "dmp_sesame.tsv.gz"))
 write_tsv_gz(integrated$intersection, file.path(analysis_dir, "cpg_intersection.tsv.gz"))
 write_tsv_gz(integrated$union, file.path(analysis_dir, "cpg_union.tsv.gz"))
 
-# ---- DMRcate ----------------------------------------------------------------
+# ---- DMRff ------------------------------------------------------------------
 
-resolve_dmrcate_coef <- function(coef_value, design) {
-  if (is.null(coef_value)) {
-    return(NULL)
-  }
-  if (is.character(coef_value)) {
-    matches <- which(colnames(design) == coef_value)
-    if (length(matches) == 0) {
-      log_message("DMRcate: coefficient %s not found in design; skipping.", coef_value)
-      return(NULL)
-    }
-    if (length(matches) > 1) {
-      log_message(
-        "DMRcate: coefficient %s matched multiple design columns (%s); using the first.",
-        coef_value,
-        paste(colnames(design)[matches], collapse = ", ")
-      )
-    }
-    return(as.integer(matches[1]))
-  }
-  if (is.numeric(coef_value) && length(coef_value) == 1 && !is.na(coef_value)) {
-    return(as.integer(coef_value))
-  }
-  log_message("DMRcate: unsupported coefficient type for %s; skipping.", as.character(coef_value)[1])
-  NULL
-}
-
-run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type, dmr_genome, comparisons, sig_table) {
-  empty_result <- data.table(
-    seqnames = character(),
+dmrff_empty_result <- function() {
+  data.table(
+    chr = character(),
     start = integer(),
     end = integer(),
-    width = integer(),
-    n.sites = integer(),
-    meanstat = numeric(),
+    n = integer(),
+    start.idx = integer(),
+    end.idx = integer(),
+    start.orig = integer(),
+    end.orig = integer(),
+    z.orig = numeric(),
+    p.orig = numeric(),
+    B = numeric(),
+    S = numeric(),
+    estimate = numeric(),
+    se = numeric(),
+    z = numeric(),
+    p.value = numeric(),
+    number.tests = numeric(),
+    p.adjust = numeric(),
+    genome = character(),
     comparison = character(),
     reference_group = character(),
     target_group = character()
   )
-  if (nrow(sig_table) == 0) {
-    log_message("Skipping DMRcate for %s: no significant CpGs detected at FDR threshold.", pipeline_name)
+}
+
+dmrff_probe_annotation <- function(MSet) {
+  anno_df <- tryCatch(as.data.frame(getAnnotation(MSet)), error = function(e) {
+    log_message("dmrff: failed to load annotation: %s", conditionMessage(e))
+    NULL
+  })
+  if (is.null(anno_df) || nrow(anno_df) == 0) {
+    return(NULL)
+  }
+  probe_id <- rownames(anno_df)
+  pick <- function(cols) {
+    for (col in cols) {
+      if (col %in% names(anno_df)) {
+        return(anno_df[[col]])
+      }
+    }
+    NULL
+  }
+  chr <- pick(c("chr", "chromosome", "seqnames"))
+  pos <- pick(c("mapinfo", "pos", "position"))
+  if (is.null(chr) || is.null(pos)) {
+    log_message("dmrff: annotation missing chr/pos; chr? %s pos? %s", !is.null(chr), !is.null(pos))
+    return(NULL)
+  }
+  data.table(
+    probe_id = probe_id,
+    chr = as.character(chr),
+    pos = as.numeric(pos)
+  )
+}
+
+run_dmrff_for_pipeline <- function(pipeline_name, M_matrix, results_table, comparisons, annotation_dt, p_cutoff = 0.05, max_gap = 500, genome = NA_character_) {
+  empty_result <- dmrff_empty_result()
+  if (is.null(results_table) || nrow(results_table) == 0) {
+    log_message("Skipping dmrff for %s: no CpG statistics available.", pipeline_name)
     return(empty_result)
   }
   if (nrow(comparisons) == 0) {
-    log_message("Skipping DMRcate for %s: no group contrasts available.", pipeline_name)
+    log_message("Skipping dmrff for %s: no group contrasts available.", pipeline_name)
+    return(empty_result)
+  }
+  if (is.null(annotation_dt) || nrow(annotation_dt) == 0) {
+    log_message("Skipping dmrff for %s: probe annotation unavailable.", pipeline_name)
+    return(empty_result)
+  }
+  if (is.null(M_matrix) || length(M_matrix) == 0) {
+    log_message("Skipping dmrff for %s: methylation matrix missing.", pipeline_name)
     return(empty_result)
   }
   results <- list()
-  sig_has_comparison <- "comparison" %in% names(sig_table)
   for (idx in seq_len(nrow(comparisons))) {
     contrast <- comparisons[idx]
     comparison_label <- contrast$comparison
-    if (sig_has_comparison && !(comparison_label %in% sig_table$comparison)) {
-      log_message("Skipping DMRcate for %s (%s): no significant CpGs for this comparison.", pipeline_name, comparison_label)
+    contrast_res <- results_table[comparison == comparison_label]
+    if (nrow(contrast_res) == 0) {
+      log_message("Skipping dmrff for %s (%s): no CpG stats for this comparison.", pipeline_name, comparison_label)
       next
     }
-    if ((is.null(contrast$contrast_formula) || !is.character(contrast$contrast_formula) || !nzchar(contrast$contrast_formula)) &&
-      (is.null(contrast$coef) || (is.character(contrast$coef) && !nzchar(contrast$coef)) || (is.numeric(contrast$coef) && is.na(contrast$coef)))) {
-      log_message("Skipping DMRcate for %s (%s): contrast lacks coefficient and contrast_formula.", pipeline_name, comparison_label)
+    if (!all(c("logFC", "t", "P.Value") %in% names(contrast_res))) {
+      log_message("Skipping dmrff for %s (%s): missing logFC/t/P.Value columns.", pipeline_name, comparison_label)
       next
     }
-    log_message("Running DMRcate for %s (%s)", pipeline_name, comparison_label)
-    annotation <- NULL
-    if (!is.null(contrast$contrast_formula) && is.character(contrast$contrast_formula) && nzchar(contrast$contrast_formula)) {
-      contrast_matrix <- tryCatch(
-        makeContrasts(contrasts = contrast$contrast_formula, levels = design),
-        error = function(e) {
-          log_message(
-            "DMRcate contrast construction failed for %s (%s): %s",
-            pipeline_name,
-            comparison_label,
-            conditionMessage(e)
-          )
-          NULL
+    contrast_res[, se := ifelse(is.finite(t) & t != 0, abs(logFC / t), NA_real_)]
+    contrast_res <- contrast_res[is.finite(se) & is.finite(P.Value) & !is.na(probe_id)]
+    if (nrow(contrast_res) == 0) {
+      log_message("Skipping dmrff for %s (%s): no CpGs with finite statistics.", pipeline_name, comparison_label)
+      next
+    }
+    annotated <- annotation_dt[probe_id %chin% contrast_res$probe_id & !is.na(chr) & !is.na(pos)]
+    if (nrow(annotated) == 0) {
+      log_message("Skipping dmrff for %s (%s): no annotation overlap.", pipeline_name, comparison_label)
+      next
+    }
+    contrast_res <- contrast_res[probe_id %chin% annotated$probe_id]
+    if (nrow(contrast_res) == 0) {
+      log_message("Skipping dmrff for %s (%s): CpGs dropped after annotation alignment.", pipeline_name, comparison_label)
+      next
+    }
+    idx_match <- match(contrast_res$probe_id, annotated$probe_id)
+    keep_mask <- !is.na(idx_match) & idx_match > 0
+    contrast_res <- contrast_res[keep_mask]
+    idx_match <- idx_match[keep_mask]
+    annotated_use <- annotated[idx_match]
+    meth_rows <- contrast_res$probe_id
+    available_rows <- meth_rows[meth_rows %in% rownames(M_matrix)]
+    if (length(available_rows) == 0) {
+      log_message("Skipping dmrff for %s (%s): CpGs missing from methylation matrix.", pipeline_name, comparison_label)
+      next
+    }
+    missing_rows <- setdiff(meth_rows, available_rows)
+    if (length(missing_rows) > 0) {
+      log_message("dmrff for %s (%s): dropping %s CpGs absent from methylation matrix.", pipeline_name, comparison_label, length(missing_rows))
+      keep_idx <- meth_rows %chin% available_rows
+      contrast_res <- contrast_res[keep_idx]
+      annotated_use <- annotated_use[keep_idx]
+      meth_rows <- contrast_res$probe_id
+    }
+    meth_matrix <- tryCatch(
+      {
+        mat <- as.matrix(M_matrix[meth_rows, , drop = FALSE])
+        if (nrow(mat) != length(meth_rows)) {
+          stop(sprintf("Subset rows (%s) != expected (%s)", nrow(mat), length(meth_rows)))
         }
-      )
-      if (!is.null(contrast_matrix)) {
-        annotation <- tryCatch(
-          cpg.annotate(
-            object = M_matrix,
-            datatype = "array",
-            what = "M",
-            arraytype = array_type,
-            analysis.type = "differential",
-            design = design,
-            contrasts = contrast_matrix,
-            coef = 1
-          ),
-          error = function(e) {
-            log_message("DMRcate annotation failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
-            NULL
-          }
-        )
-      }
-    } else {
-      resolved_coef <- resolve_dmrcate_coef(contrast$coef, design)
-      if (is.null(resolved_coef)) {
-        next
-      }
-      annotation <- tryCatch(
-        cpg.annotate(
-          object = M_matrix,
-          datatype = "array",
-          what = "M",
-          arraytype = array_type,
-          analysis.type = "differential",
-          design = design,
-          coef = resolved_coef
-        ),
-        error = function(e) {
-          log_message("DMRcate annotation failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
-          NULL
-        }
-      )
-    }
-    if (is.null(annotation)) {
-      next
-    }
-    dmr_obj <- tryCatch(dmrcate(annotation), error = function(e) {
-      log_message("DMRcate modelling failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
-      NULL
-    })
-    if (is.null(dmr_obj)) {
-      next
-    }
-    dmr_ranges <- tryCatch(
-      as.data.table(as.data.frame(extractRanges(dmr_obj, genome = dmr_genome))),
+        mat
+      },
       error = function(e) {
-        log_message("DMRcate range extraction failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
+        log_message("dmrff for %s (%s): failed to subset methylation matrix: %s", pipeline_name, comparison_label, conditionMessage(e))
         NULL
       }
     )
-    if (!is.null(dmr_ranges) && nrow(dmr_ranges) > 0) {
-      dmr_ranges[, comparison := comparison_label]
-      dmr_ranges[, reference_group := contrast$reference_group]
-      dmr_ranges[, target_group := contrast$target_group]
-      results[[comparison_label]] <- dmr_ranges
+    if (is.null(meth_matrix)) {
+      next
+    }
+    dmr_res <- tryCatch(
+      dmrff::dmrff(
+        estimate = contrast_res$logFC,
+        se = contrast_res$se,
+        p.value = contrast_res$P.Value,
+        methylation = meth_matrix,
+        chr = annotated_use$chr,
+        pos = annotated_use$pos,
+        maxgap = max_gap,
+        p.cutoff = p_cutoff,
+        verbose = TRUE
+      ),
+      error = function(e) {
+        log_message("dmrff failed for %s (%s): %s", pipeline_name, comparison_label, conditionMessage(e))
+        NULL
+      }
+    )
+    if (!is.null(dmr_res) && nrow(dmr_res) > 0) {
+      dmr_dt <- as.data.table(dmr_res)
+      dmr_dt[, comparison := comparison_label]
+      dmr_dt[, reference_group := contrast$reference_group]
+      dmr_dt[, target_group := contrast$target_group]
+      dmr_dt[, genome := genome %||% NA_character_]
+      results[[comparison_label]] <- dmr_dt
     } else {
-      log_message("DMRcate produced no ranges for %s (%s).", pipeline_name, comparison_label)
+      log_message("dmrff produced no regions for %s (%s).", pipeline_name, comparison_label)
     }
   }
   if (length(results) == 0) {
@@ -5162,47 +5392,25 @@ run_dmrcate_for_pipeline <- function(pipeline_name, M_matrix, design, array_type
   rbindlist(results, fill = TRUE, use.names = TRUE)
 }
 
-log_message("Running DMRcate...")
-array_type <- platform_info$dmr
+log_message("Running dmrff (DMR detection)...")
+dmrff_annotation_dt <- dmrff_probe_annotation(MSet)
+dmrff_p_cutoff <- tryCatch(
+  {
+    pc <- opt$p_threshold
+    if (is.null(pc) || !is.finite(pc) || pc <= 0 || pc > 1) {
+      0.05
+    } else {
+      min(pc, 0.05)
+    }
+  },
+  error = function(...) 0.05
+)
 dmr_genome <- platform_info$dmr_genome %||% "hg38"
-supported_array_types <- c("450K", "EPIC", "EPICv2", "27K")
-if (!(array_type %in% supported_array_types)) {
-  log_message("DMRcate skipped: unsupported array type %s (supported: %s)", array_type, paste(supported_array_types, collapse = ", "))
-  dmr_minfi <- data.table(
-    seqnames = character(),
-    start = integer(),
-    end = integer(),
-    width = integer(),
-    n.sites = integer(),
-    meanstat = numeric(),
-    comparison = character(),
-    reference_group = character(),
-    target_group = character()
-  )
-  write_tsv_gz(dmr_minfi, file.path(analysis_dir, "dmr_minfi.tsv.gz"))
-  dmr_sesame <- dmr_minfi
-  write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
+dmr_minfi <- run_dmrff_for_pipeline("minfi", M_minfi_corrected, results_minfi, group_comparisons, dmrff_annotation_dt, p_cutoff = dmrff_p_cutoff, genome = dmr_genome)
+if (sesame_available && !is.null(M_sesame_corrected)) {
+  dmr_sesame <- run_dmrff_for_pipeline("sesame", M_sesame_corrected, results_sesame, group_comparisons, dmrff_annotation_dt, p_cutoff = dmrff_p_cutoff, genome = dmr_genome)
 } else {
-  dmr_minfi <- run_dmrcate_for_pipeline("minfi", M_minfi_corrected, design_for_limma, array_type, dmr_genome, group_comparisons, sig_minfi)
-  write_tsv_gz(dmr_minfi, file.path(analysis_dir, "dmr_minfi.tsv.gz"))
-
-  if (sesame_available && !is.null(M_sesame_corrected)) {
-    dmr_sesame <- run_dmrcate_for_pipeline("sesame", M_sesame_corrected, design_for_limma, array_type, dmr_genome, group_comparisons, sig_sesame)
-    write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
-  } else {
-    dmr_sesame <- data.table(
-      seqnames = character(),
-      start = integer(),
-      end = integer(),
-      width = integer(),
-      n.sites = integer(),
-      meanstat = numeric(),
-      comparison = character(),
-      reference_group = character(),
-      target_group = character()
-    )
-    write_tsv_gz(dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
-  }
+  dmr_sesame <- dmrff_empty_result()
 }
 
 # ---- Annotation -------------------------------------------------------------
@@ -5215,6 +5423,197 @@ if (!"probe_id" %in% names(anno_df)) {
 annotation_data <- as.data.table(anno_df)
 setnames(annotation_data, names(annotation_data), tolower(names(annotation_data)))
 setkey(annotation_data, probe_id)
+
+collapse_field <- function(values) {
+  vals <- unique(trimws(as.character(unlist(strsplit(paste(values, collapse = ";"), ";", fixed = TRUE)))))
+  vals <- vals[!is.na(vals) & nzchar(vals)]
+  if (length(vals) == 0) {
+    return(NA_character_)
+  }
+  paste(vals, collapse = ";")
+}
+
+annotate_dmrs <- function(dmr_dt, annotation_dt) {
+  if (is.null(dmr_dt) || nrow(dmr_dt) == 0) {
+    empty <- as.data.table(dmr_dt)
+    ensure_cols <- c("n_probes", "probes", "genes", "gene_groups", "island_relation")
+    for (col in ensure_cols) {
+      if (!col %in% names(empty)) {
+        empty[, (col) := vector(mode = if (col == "n_probes") "integer" else "character", length = 0)]
+      }
+    }
+    return(empty)
+  }
+  dmr_work <- as.data.table(dmr_dt)
+  if ("start" %in% names(dmr_work)) dmr_work[, start := as.integer(start)]
+  if ("end" %in% names(dmr_work)) dmr_work[, end := as.integer(end)]
+  dmr_work <- dmr_work[!is.na(start) & !is.na(end) & is.finite(start) & is.finite(end)]
+  if (nrow(dmr_work) == 0) {
+    log_message("dmrff: no DMRs with finite start/end for annotation.")
+    return(dmrff_empty_result()[0])
+  }
+  required_cols <- c("chr", "start", "end")
+  if (!all(required_cols %in% names(dmr_dt))) {
+    log_message("dmrff: skipping DMR annotation; required columns missing.")
+    return(dmr_work)
+  }
+  ann <- as.data.table(annotation_dt)
+  ann <- ann[!is.na(mapinfo) & is.finite(mapinfo) & !is.na(chr)]
+  if (nrow(ann) == 0) {
+    return(dmr_work)
+  }
+  ann_ranges <- ann[, .(
+    chr = as.character(chr),
+    start = as.integer(mapinfo),
+    end = as.integer(mapinfo),
+    probe_id = probe_id,
+    gene = ucsc_refgene_name %||% NA_character_,
+    gene_group = ucsc_refgene_group %||% NA_character_,
+    island = relation_to_island %||% NA_character_
+  )]
+  ann_ranges <- ann_ranges[!is.na(start) & !is.na(end)]
+  if (nrow(ann_ranges) == 0) {
+    return(dmr_dt)
+  }
+  setkey(ann_ranges, chr, start, end)
+  dmr_work[, idx := seq_len(.N)]
+  dmr_ranges <- dmr_work[, .(
+    chr = as.character(chr),
+    start = as.integer(start),
+    end = as.integer(end),
+    idx = idx
+  )]
+  setkey(dmr_ranges, chr, start, end)
+  overlaps <- foverlaps(ann_ranges, dmr_ranges, nomatch = 0L)
+  if (nrow(overlaps) == 0) {
+    dmr_work[, `:=`(
+      n_probes = 0L,
+      probes = NA_character_,
+      genes = NA_character_,
+      gene_groups = NA_character_,
+      island_relation = NA_character_
+    )]
+    dmr_work[, idx := NULL]
+    return(dmr_work)
+  }
+  summary <- overlaps[, .(
+    n_probes = uniqueN(probe_id),
+    probes = collapse_field(probe_id),
+    genes = collapse_field(gene),
+    gene_groups = collapse_field(gene_group),
+    island_relation = collapse_field(island)
+  ), by = idx]
+  dmr_work[summary, `:=`(
+    n_probes = i.n_probes,
+    probes = i.probes,
+    genes = i.genes,
+    gene_groups = i.gene_groups,
+    island_relation = i.island_relation
+  ), on = "idx"]
+  dmr_work[is.na(n_probes), n_probes := 0L]
+  dmr_work[, idx := NULL]
+  dmr_work
+}
+
+simplify_dmr_table <- function(dt, keep_cols = NULL, max_items = 10, max_chars = 200) {
+  if (is.null(dt) || nrow(dt) == 0) {
+    return(dt)
+  }
+  dt <- copy(as.data.table(dt))
+  if (!is.null(keep_cols)) {
+    cols <- intersect(keep_cols, names(dt))
+    dt <- dt[, ..cols]
+  }
+  shorten_field <- function(values) {
+    vapply(values, function(val) {
+      if (is.null(val) || is.na(val) || !nzchar(val)) return(NA_character_)
+      parts <- unlist(strsplit(as.character(val), ";", fixed = TRUE))
+      parts <- trimws(parts)
+      parts <- parts[nzchar(parts)]
+      if (length(parts) == 0) return(NA_character_)
+      if (length(parts) > max_items) {
+        extra <- length(parts) - max_items
+        parts <- c(head(parts, max_items), sprintf("+%s more", extra))
+      }
+      collapsed <- paste(parts, collapse = ";")
+      if (nchar(collapsed) > max_chars) {
+        collapsed <- paste0(substr(collapsed, 1, max_chars - 3), "...")
+      }
+      collapsed
+    }, character(1))
+  }
+  long_cols <- intersect(c("probes", "genes", "gene_groups", "island_relation", "combined_probes", "combined_genes"), names(dt))
+  for (col in long_cols) {
+    dt[[col]] <- shorten_field(dt[[col]])
+  }
+  dt
+}
+
+intersect_dmrs <- function(dmr_minfi_dt, dmr_sesame_dt) {
+  if (is.null(dmr_minfi_dt) || is.null(dmr_sesame_dt) || nrow(dmr_minfi_dt) == 0 || nrow(dmr_sesame_dt) == 0) {
+    return(data.table())
+  }
+  lhs <- copy(as.data.table(dmr_minfi_dt))
+  rhs <- copy(as.data.table(dmr_sesame_dt))
+  if ("start" %in% names(lhs)) lhs[, start := as.integer(start)]
+  if ("end" %in% names(lhs)) lhs[, end := as.integer(end)]
+  if ("start" %in% names(rhs)) rhs[, start := as.integer(start)]
+  if ("end" %in% names(rhs)) rhs[, end := as.integer(end)]
+  lhs <- lhs[!is.na(start) & !is.na(end)]
+  rhs <- rhs[!is.na(start) & !is.na(end)]
+  if (!"comparison" %in% names(lhs) || !"comparison" %in% names(rhs)) {
+    lhs[, comparison := "comparison"]
+    rhs[, comparison := "comparison"]
+  }
+  setnames(lhs, old = c("start", "end"), new = c("start_lhs", "end_lhs"))
+  setnames(rhs, old = c("start", "end"), new = c("start_rhs", "end_rhs"))
+  setkey(lhs, chr, start_lhs, end_lhs)
+  setkey(rhs, chr, start_rhs, end_rhs)
+  overlaps <- foverlaps(lhs, rhs, by.x = c("chr", "start_lhs", "end_lhs"), by.y = c("chr", "start_rhs", "end_rhs"), nomatch = 0L, type = "any")
+  overlaps <- overlaps[comparison == i.comparison]
+  if (nrow(overlaps) == 0) {
+    return(data.table())
+  }
+  overlaps[, overlap_start := pmax(start_lhs, start_rhs)]
+  overlaps[, overlap_end := pmin(end_lhs, end_rhs)]
+  overlaps <- overlaps[overlap_start <= overlap_end]
+  if (nrow(overlaps) == 0) {
+    return(data.table())
+  }
+  overlaps[, overlap_width := overlap_end - overlap_start + 1L]
+  overlaps[, minfi_p := i.p.adjust %||% NA_real_]
+  overlaps[, sesame_p := p.adjust %||% NA_real_]
+  overlaps[, minfi_n := i.n %||% NA_integer_]
+  overlaps[, sesame_n := n %||% NA_integer_]
+  overlaps[, minfi_genes := i.genes %||% NA_character_]
+  overlaps[, sesame_genes := genes %||% NA_character_]
+  overlaps[, minfi_probes := i.probes %||% NA_character_]
+  overlaps[, sesame_probes := probes %||% NA_character_]
+  overlaps[, combined_genes := collapse_field(c(minfi_genes, sesame_genes))]
+  overlaps[, combined_probes := collapse_field(c(minfi_probes, sesame_probes))]
+  overlaps[, genome := i.genome %||% genome %||% NA_character_]
+  out <- overlaps[, .(
+    chr,
+    start = overlap_start,
+    end = overlap_end,
+    width = overlap_width,
+    comparison,
+    reference_group = reference_group,
+    target_group = target_group,
+    genome,
+    minfi_p.adjust = minfi_p,
+    sesame_p.adjust = sesame_p,
+    minfi_n = minfi_n,
+    sesame_n = sesame_n,
+    minfi_genes = minfi_genes,
+    sesame_genes = sesame_genes,
+    combined_genes = combined_genes,
+    minfi_probes = minfi_probes,
+    sesame_probes = sesame_probes,
+    combined_probes = combined_probes
+  )]
+  unique(out)
+}
 
 pick_column <- function(dt, options, default = NA_character_) {
   for (opt in options) {
@@ -5233,6 +5632,43 @@ annotations_clean <- data.table(
   ucsc_refgene_group = pick_column(annotation_data, c("ucsc_refgene_group", "gene_group")),
   relation_to_island = pick_column(annotation_data, c("relation_to_island", "relationtoisland"))
 )
+
+dmr_annotation_table <- data.table(
+  probe_id = annotation_data$probe_id,
+  chr = pick_column(annotation_data, c("chr", "chromosome", "seqnames")),
+  mapinfo = pick_column(annotation_data, c("mapinfo", "pos", "position"), default = NA_real_),
+  ucsc_refgene_name = pick_column(annotation_data, c("ucsc_refgene_name", "gene", "gene_symbol")),
+  ucsc_refgene_group = pick_column(annotation_data, c("ucsc_refgene_group", "gene_group")),
+  relation_to_island = pick_column(annotation_data, c("relation_to_island", "relationtoisland"))
+)
+
+annotated_dmr_minfi <- annotate_dmrs(dmr_minfi, dmr_annotation_table)
+if (sesame_available && nrow(dmr_sesame) > 0) {
+  annotated_dmr_sesame <- annotate_dmrs(dmr_sesame, dmr_annotation_table)
+} else {
+  annotated_dmr_sesame <- dmr_sesame
+}
+
+write_tsv_gz(annotated_dmr_minfi, file.path(analysis_dir, "dmr_minfi.tsv.gz"))
+write_tsv_gz(annotated_dmr_sesame, file.path(analysis_dir, "dmr_sesame.tsv.gz"))
+
+annotated_dmr_intersection <- intersect_dmrs(annotated_dmr_minfi, annotated_dmr_sesame)
+write_tsv_gz(annotated_dmr_intersection, file.path(analysis_dir, "dmr_intersection.tsv.gz"))
+
+dmr_intersection_cap <- opt$dmr_intersection_top
+if (is.null(dmr_intersection_cap) || is.na(dmr_intersection_cap) || dmr_intersection_cap <= 0) {
+  dmr_intersection_cap <- 10000L
+}
+annotated_dmr_intersection_top <- copy(annotated_dmr_intersection)
+order_cols <- intersect(c("p.adjust", "padj", "p_value", "pval", "p.value"), names(annotated_dmr_intersection_top))
+if (length(order_cols) > 0) {
+  setorderv(annotated_dmr_intersection_top, cols = order_cols, order = rep(1L, length(order_cols)))
+}
+if (nrow(annotated_dmr_intersection_top) > dmr_intersection_cap) {
+  annotated_dmr_intersection_top <- annotated_dmr_intersection_top[seq_len(dmr_intersection_cap)]
+}
+write_tsv_gz(annotated_dmr_intersection_top, file.path(analysis_dir, "dmr_intersection_top.tsv.gz"))
+
 format_gene_field <- function(x) {
   if (is.null(x) || all(is.na(x))) {
     return(rep(NA_character_, length(x)))
@@ -5444,57 +5880,146 @@ if (!is.null(annotated_intersection) && nrow(annotated_intersection) > 0 && !is.
 
 # ---- Helper utilities for enhanced outputs ---------------------------------
 
-safe_gene_list <- function(dt, gene_col = "gene_symbols", max_genes = 2000) {
-  if (is.null(dt) || nrow(dt) == 0 || !gene_col %in% names(dt)) {
-    return(character())
+load_fgsea_pathways <- function(project_root) {
+  repo_root <- Sys.getenv("RENV_PROJECT", unset = project_root)
+  candidates <- unique(c(
+    file.path(project_root, ".dearmeta_cache", "msigdb", "msigdb_fgsea_hs.rds"),
+    file.path(repo_root, ".dearmeta_cache", "msigdb", "msigdb_fgsea_hs.rds")
+  ))
+  for (cache_file in candidates) {
+    if (file.exists(cache_file)) {
+      loaded <- tryCatch(readRDS(cache_file), error = function(e) {
+        log_message("Failed to read cached MSigDB gene sets at %s: %s", cache_file, conditionMessage(e))
+        NULL
+      })
+      if (!is.null(loaded)) {
+        return(loaded)
+      }
+    }
   }
-  vals <- dt[[gene_col]]
-  if (is.null(vals)) {
-    return(character())
+  cache_file <- candidates[1]
+  if (!requireNamespace("msigdbr", quietly = TRUE)) {
+    log_message("MSigDB gene sets not cached and msigdbr unavailable; skipping enrichment.")
+    return(NULL)
   }
-  genes <- unique(unlist(strsplit(paste(vals, collapse = ";"), "[;,\\s]+")))
-  genes <- trimws(genes)
-  genes <- genes[genes != ""]
-  head(genes, max_genes)
+  log_message("MSigDB cache missing at %s; attempting live download via msigdbr.", cache_file)
+  fetch_set <- function(category, subcategory = NULL) {
+    msigdbr::msigdbr(
+      species = "Homo sapiens",
+      category = category,
+      subcategory = subcategory
+    )
+  }
+  c2 <- fetch_set("C2")
+  c5 <- fetch_set("C5")
+  reactome <- fetch_set("C2", "CP:REACTOME")
+  to_list <- function(df) {
+    split(df$gene_symbol, paste(df$gs_name, df$gs_cat, df$gs_subcat, sep = "|"))
+  }
+  payload <- list(
+    C2 = to_list(c2),
+    C5 = to_list(c5),
+    REACTOME = to_list(reactome)
+  )
+  dir.create(dirname(cache_file), recursive = TRUE, showWarnings = FALSE)
+  tryCatch(saveRDS(payload, cache_file), error = function(e) {
+    log_message("Failed to write MSigDB cache to %s: %s", cache_file, conditionMessage(e))
+  })
+  payload
 }
 
-run_enrichment <- function(dt, label, gene_col = "gene_symbols", sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG")) {
-  genes <- safe_gene_list(dt, gene_col)
-  if (length(genes) < 5) {
-    return(list(results = data.table(), message = sprintf("Not enough genes for %s (n=%s)", label, length(genes))))
+build_gene_ranks <- function(res_dt, annotation_dt, gene_col = "ucsc_refgene_name") {
+  if (is.null(res_dt) || nrow(res_dt) == 0) {
+    return(numeric())
   }
-  gost_res <- tryCatch(
-    gprofiler2::gost(
-      query = genes,
-      organism = "hsapiens",
-      sources = sources,
-      user_threshold = 0.05,
-      correction_method = "fdr"
-    ),
-    error = function(e) e
+  gene_lookup <- annotation_dt[, .(probe_id, gene = get(gene_col))]
+  merged <- merge(res_dt, gene_lookup, by = "probe_id", allow.cartesian = TRUE, all.x = TRUE)
+  if (nrow(merged) == 0 || !"gene" %in% names(merged)) {
+    return(numeric())
+  }
+  merged[, gene := trimws(as.character(gene))]
+  merged <- merged[!is.na(gene) & nzchar(gene)]
+  if (nrow(merged) == 0) {
+    return(numeric())
+  }
+  merged[, score := fifelse(is.finite(t), t, NA_real_)]
+  merged[is.na(score) & is.finite(P.Value), score := sign(logFC %||% 0) * -log10(P.Value)]
+  merged[is.na(score) & is.finite(logFC), score := logFC]
+  ranks <- merged[is.finite(score), .(score = median(score, na.rm = TRUE)), by = gene]
+  if (nrow(ranks) == 0) {
+    return(numeric())
+  }
+  stats <- ranks$score
+  names(stats) <- ranks$gene
+  stats <- stats[is.finite(stats)]
+  stats[order(stats, decreasing = TRUE)]
+}
+
+run_enrichment <- function(res_dt, label, annotation_dt, pathways) {
+  if (is.null(pathways) || length(pathways) == 0) {
+    return(list(results = data.table(), message = "Enrichment skipped: MSigDB pathways unavailable."))
+  }
+  stats <- build_gene_ranks(res_dt, annotation_dt)
+  if (length(stats) < 10) {
+    return(list(results = data.table(), message = sprintf("Not enough ranked genes for %s (n=%s)", label, length(stats))))
+  }
+  fgsea_safe <- function(path_list, tag) {
+    res <- tryCatch(
+      fgsea::fgsea(
+        pathways = path_list,
+        stats = stats,
+        minSize = 10,
+        maxSize = 500,
+        eps = 0,
+        scoreType = "std"
+      ),
+      error = function(e) {
+        log_message("fgsea failed for %s (%s): %s", label, tag, conditionMessage(e))
+        NULL
+      }
+    )
+    if (is.null(res) || nrow(res) == 0) {
+      return(NULL)
+    }
+    res$collection <- tag
+    res
+  }
+  combined <- list(
+    fgsea_safe(pathways$C2, "C2"),
+    fgsea_safe(pathways$C5, "C5"),
+    fgsea_safe(pathways$REACTOME, "REACTOME")
   )
-  if (inherits(gost_res, "error") || is.null(gost_res$result) || nrow(gost_res$result) == 0) {
-    msg <- if (inherits(gost_res, "error")) conditionMessage(gost_res) else "No enrichment terms returned"
-    return(list(results = data.table(), message = sprintf("%s enrichment unavailable: %s", label, msg)))
+  combined <- Filter(function(x) !is.null(x) && nrow(x) > 0, combined)
+  if (length(combined) == 0) {
+    return(list(results = data.table(), message = sprintf("No enriched terms for %s", label)))
   }
-  enr <- as.data.table(gost_res$result)
-  enr[, neg_log10_p := -log10(p_value)]
-  enr[, label := label]
-  list(results = enr, message = NULL)
+  dt <- rbindlist(combined, use.names = TRUE, fill = TRUE)
+  setDT(dt)
+  dt[, leadingEdge := vapply(leadingEdge, function(le) paste(le, collapse = ";"), character(1))]
+  dt[, label := label]
+  dt <- dt[order(padj, pval)]
+  list(results = dt, message = NULL)
 }
 
 enrichment_bar_plot <- function(enr, title, top_n = 10) {
   if (is.null(enr) || nrow(enr) == 0) {
     return(ggplot() + theme_void() + labs(title = paste(title, "(no enrichment)")))
   }
-  top <- enr[order(p_value)][1:min(top_n, nrow(enr))]
-  top[, term_label := sprintf("%s · %s", source, term_name)]
+  display <- enr
+  if ("padj" %in% names(display)) {
+    filtered <- display[is.finite(padj) & padj <= 0.1]
+    if (nrow(filtered) > 0) {
+      display <- filtered
+    }
+  }
+  top <- display[order(padj, pval)][1:min(top_n, nrow(display))]
+  top[, term_label := sprintf("%s · %s", collection %||% "MSigDB", pathway)]
   top[, term_label := factor(term_label, levels = rev(unique(term_label)))]
-  ggplot(top, aes(x = term_label, y = neg_log10_p, fill = source)) +
+  ggplot(top, aes(x = term_label, y = NES, fill = collection)) +
     geom_col(width = 0.7) +
     coord_flip() +
     theme_minimal() +
-    labs(title = title, x = NULL, y = "-log10(p-value)", fill = "Source")
+    labs(title = title, x = NULL, y = "Normalized Enrichment Score (NES)", fill = "Collection")
 }
 
 overlap_count_table <- function(sig_minfi, sig_sesame) {
@@ -5518,7 +6043,7 @@ overlap_bar_plot <- function(counts, title) {
   labels <- c(minfi_only = "Unique to minfi", both = "Intersection", sesame_only = "Unique to sesame")
   ggplot(counts, aes(x = membership, y = count, fill = membership)) +
     geom_col(width = 0.65) +
-    scale_fill_manual(values = c(minfi_only = "#3b8bba", both = "#6a4c93", sesame_only = "#e24a33"), labels = labels, guide = FALSE) +
+    scale_fill_manual(values = c(minfi_only = "#3b8bba", both = "#6a4c93", sesame_only = "#e24a33"), labels = labels, guide = "none") +
     theme_minimal() +
     scale_x_discrete(labels = labels) +
     labs(title = title, x = NULL, y = "CpG count")
@@ -5782,6 +6307,7 @@ prepare_volcano_data <- function(results, fdr_threshold = opt$fdr_threshold, sam
     return(data.frame())
   }
   result_names <- names(results) %||% character()
+  delta_thr <- opt$delta_beta_threshold %||% 0
   to_numeric <- function(x) {
     if (is.null(x)) return(rep(NA_real_, length(results[[1]] %||% numeric())))
     as.numeric(x)
@@ -5842,6 +6368,11 @@ prepare_volcano_data <- function(results, fdr_threshold = opt$fdr_threshold, sam
   df$adj.P.Val <- pmax(df$adj.P.Val, .Machine$double.xmin)
   df$neg_log_p <- -log10(df$P.Value)
   df$.plot_row_id <- seq_len(nrow(df))
+  sig_flag <- if (!is.null(fdr_threshold) && length(fdr_threshold) == 1 && is.finite(fdr_threshold)) {
+    df$adj.P.Val <= fdr_threshold & abs(df$delta_beta) >= delta_thr
+  } else {
+    rep(FALSE, nrow(df))
+  }
   priority_idx <- integer(0)
   if (any(!is.na(df$GeneSymbol_cgid) & df$GeneSymbol_cgid != "")) {
     top_rows <- select_top_label_rows(
@@ -5860,26 +6391,23 @@ prepare_volcano_data <- function(results, fdr_threshold = opt$fdr_threshold, sam
   if (nrow(df) > sample_size) {
     set.seed(1234)
     total_idx <- seq_len(nrow(df))
+    sig_idx <- total_idx[sig_flag]
+    nonsig_idx <- setdiff(total_idx, sig_idx)
     if (length(priority_idx) > 0) {
       priority_idx <- priority_idx[priority_idx %in% total_idx]
-      remaining <- setdiff(total_idx, priority_idx)
-      needed <- max(sample_size - length(priority_idx), 0L)
-      random_idx <- if (needed > 0 && length(remaining) > 0) {
-        sample(remaining, min(needed, length(remaining)))
-      } else {
-        integer(0)
-      }
-      keep_idx <- sort(unique(c(priority_idx, random_idx)))
-    } else {
-      keep_idx <- sample(total_idx, sample_size)
+    }
+    keep_idx <- sig_idx
+    remaining_pool <- setdiff(nonsig_idx, keep_idx)
+    if (length(priority_idx) > 0) {
+      keep_idx <- sort(unique(c(keep_idx, priority_idx)))
+      remaining_pool <- setdiff(remaining_pool, keep_idx)
+    }
+    needed <- max(sample_size - length(keep_idx), 0L)
+    if (needed > 0 && length(remaining_pool) > 0) {
+      keep_idx <- sort(unique(c(keep_idx, sample(remaining_pool, min(needed, length(remaining_pool))))))
     }
     df <- df[keep_idx, , drop = FALSE]
-  }
-  df$.plot_row_id <- NULL
-  sig_flag <- if (!is.null(fdr_threshold) && length(fdr_threshold) == 1 && is.finite(fdr_threshold)) {
-    df$adj.P.Val <= fdr_threshold
-  } else {
-    rep(FALSE, nrow(df))
+    sig_flag <- sig_flag[keep_idx]
   }
   df$significant <- factor(ifelse(sig_flag, "sig", "not_sig"), levels = c("not_sig", "sig"))
   df$hover_id <- if (!is.null(df$probe_id)) df$probe_id else sprintf("Row %s", seq_len(nrow(df)))
@@ -6001,7 +6529,38 @@ build_volcano_plotly <- function(results, title, fdr_threshold = opt$fdr_thresho
   if (nrow(df) == 0) {
     return(NULL)
   }
-  colors <- c(not_sig = "grey60", sig = "firebrick")
+  df <- data.table::as.data.table(df)
+  delta_thr <- opt$delta_beta_threshold %||% 0
+  sig_line <- -log10(fdr_threshold %||% 0.05)
+  df[, volcano_cat := fifelse(
+    adj.P.Val <= fdr_threshold & abs(delta_beta) >= delta_thr & delta_beta > 0,
+    "Up (signif)",
+    fifelse(
+      adj.P.Val <= fdr_threshold & abs(delta_beta) >= delta_thr & delta_beta < 0,
+      "Down (signif)",
+      "Not significant"
+    )
+  )]
+  colors <- c(
+    "Down (signif)" = "#1D4ED8",
+    "Not significant" = "#94A3B8",
+    "Up (signif)" = "#B91C1C"
+  )
+  label_str <- if (!is.null(df$GeneSymbol_cgid)) {
+    safe_label <- ifelse(is.na(df$GeneSymbol_cgid) | df$GeneSymbol_cgid == "", NA_character_, df$GeneSymbol_cgid)
+    ifelse(is.na(safe_label), "", paste0("<br>Label: ", safe_label))
+  } else {
+    ""
+  }
+  tooltip <- paste0(
+    "Category: ", df$volcano_cat,
+    "<br>Δβ: ", sprintf("%.3f", df$delta_beta),
+    "<br>-log10(p-value): ", sprintf("%.2f", df$neg_log_p),
+    "<br>FDR: ", sprintf("%.3g", df$adj.P.Val),
+    if (!is.null(df$probe_id)) paste0("<br>CpG: ", df$probe_id) else "",
+    label_str
+  )
+  df$volcano_tooltip <- tooltip
   label_df <- select_top_label_rows(
     df,
     label_col = "GeneSymbol_cgid",
@@ -6011,37 +6570,45 @@ build_volcano_plotly <- function(results, title, fdr_threshold = opt$fdr_thresho
     top_n = 10,
     prefer_high_score = TRUE
   )
-  label_str <- if (!is.null(df$GeneSymbol_cgid)) {
-    safe_label <- ifelse(is.na(df$GeneSymbol_cgid) | df$GeneSymbol_cgid == "", NA_character_, df$GeneSymbol_cgid)
-    ifelse(is.na(safe_label), "", paste0("<br>Label: ", safe_label))
-  } else {
-    ""
-  }
-  tooltip <- paste0(
-    "Δβ: ", sprintf("%.3f", df$delta_beta),
-    "<br>-log10(p-value): ", sprintf("%.2f", df$neg_log_p),
-    "<br>FDR: ", sprintf("%.3g", df$adj.P.Val),
-    if (!is.null(df$probe_id)) paste0("<br>CpG: ", df$probe_id) else "",
-    label_str
-  )
+  label_df <- data.table::as.data.table(label_df)
   plot_obj <- plotly::plot_ly(
     df,
     x = ~delta_beta,
     y = ~neg_log_p,
-    color = ~significant,
+    color = ~volcano_cat,
     colors = colors,
     type = "scattergl",
     mode = "markers",
-    marker = list(size = 6, opacity = 0.6),
-    text = tooltip,
-    hoverinfo = "text"
+    marker = list(size = 7, opacity = 0.55),
+    text = ~volcano_tooltip,
+    hoverinfo = "text",
+    hovertext = ~volcano_tooltip
   ) %>%
     plotly::layout(
       title = title,
-      xaxis = list(title = "Delta beta"),
-      yaxis = list(title = "-log10(p-value)")
+      xaxis = list(title = "Delta beta", zeroline = FALSE),
+      yaxis = list(title = "-log10(p-value)", zeroline = FALSE),
+      shapes = list(
+        list(
+          type = "line", x0 = 0, x1 = 0, xref = "x", y0 = 0, y1 = max(df$neg_log_p) * 1.05,
+          line = list(color = "rgba(148, 163, 184, 0.65)", width = 1, dash = "dot")
+        ),
+        list(
+          type = "line", x0 = min(df$delta_beta, na.rm = TRUE), x1 = max(df$delta_beta, na.rm = TRUE),
+          xref = "x", y0 = sig_line, y1 = sig_line,
+          line = list(color = "rgba(148, 163, 184, 0.65)", width = 1, dash = "dot")
+        )
+      ),
+      legend = list(orientation = "h", x = 0, y = 1.1)
     )
   if (nrow(label_df) > 0) {
+    if (".plot_row_id" %in% names(label_df) && ".plot_row_id" %in% names(df) && "volcano_tooltip" %in% names(df)) {
+      label_df[, volcano_tooltip := df$volcano_tooltip[match(.plot_row_id, df$.plot_row_id)]]
+    } else if ("volcano_tooltip" %in% names(df) && "probe_id" %in% names(label_df) && "probe_id" %in% names(df)) {
+      label_df[, volcano_tooltip := df$volcano_tooltip[match(probe_id, df$probe_id)]]
+    } else if ("volcano_tooltip" %in% names(df)) {
+      label_df$volcano_tooltip <- df$volcano_tooltip[1]
+    }
     plot_obj <- plotly::add_trace(
       plot_obj,
       data = label_df,
@@ -6050,9 +6617,10 @@ build_volcano_plotly <- function(results, title, fdr_threshold = opt$fdr_thresho
       type = "scatter",
       mode = "text",
       text = ~GeneSymbol_cgid,
+      hoverinfo = "text",
+      hovertext = ~volcano_tooltip,
       textposition = "top center",
       showlegend = FALSE,
-      hoverinfo = "none",
       textfont = list(color = "#222222", size = 10)
     )
   }
@@ -6145,6 +6713,21 @@ write_table_widget <- function(data, filename, title, subtitle = NULL, descripti
   }
   use_buttons <- nrow(data) <= 1000
   widget_error <- NULL
+  reorder_columns <- function(df) {
+    if (ncol(df) == 0) return(df)
+    preferred <- c(
+      "genes", "gene_symbols", "gene_symbol", "gene", "probes", "probe_id", "probe_ids", "cgid", "cpg",
+      "chr", "chrom", "start", "end", "width", "n_probes", "genome",
+      "p.adjust", "padj", "adj.P.Val", "p_adj", "P.Value", "p.value", "pvalue",
+      "minfi_p.adjust", "sesame_p.adjust", "minfi_p", "sesame_p",
+      "delta_beta", "estimate", "logFC", "t", "B", "se",
+      "comparison", "reference_group", "target_group"
+    )
+    existing_pref <- intersect(preferred, names(df))
+    remaining <- setdiff(names(df), existing_pref)
+    df[, c(existing_pref, remaining), drop = FALSE]
+  }
+  data <- reorder_columns(as.data.frame(data))
   gene_col_targets <- which(names(data) %in% c("gene_symbols", "GeneSymbol", "GeneSymbol_cgid", "genesymbol_cgid")) - 1L
   if (length(gene_col_targets) > 0) {
     column_defs <- list(
@@ -6163,11 +6746,76 @@ write_table_widget <- function(data, filename, title, subtitle = NULL, descripti
         )
       )
     )
+    gene_col_targets <- as.integer(gene_col_targets)
   } else {
     column_defs <- NULL
   }
+  pval_cols <- c(
+    "p.adjust", "padj", "adj.P.Val", "p_adj", "P.Value", "p.value", "pvalue",
+    "minfi_p.adjust", "sesame_p.adjust", "minfi_p", "sesame_p"
+  )
+  pval_targets <- which(names(data) %in% pval_cols) - 1L
+  if (length(pval_targets) > 0) {
+    pval_defs <- list(
+      list(
+        targets = as.integer(pval_targets),
+        width = "90px",
+        className = "dt-nowrap"
+      )
+    )
+    column_defs <- c(column_defs, pval_defs)
+  }
+  effect_cols <- c("delta_beta", "estimate", "logFC", "B", "se")
+  effect_targets <- which(names(data) %in% effect_cols) - 1L
+  if (length(effect_targets) > 0) {
+    effect_defs <- list(
+      list(
+        targets = as.integer(effect_targets),
+        width = "90px",
+        className = "dt-nowrap"
+      )
+    )
+    column_defs <- c(column_defs, effect_defs)
+  }
+  coord_cols <- c("chr", "chrom", "start", "end", "width", "n_probes")
+  coord_targets <- which(names(data) %in% coord_cols) - 1L
+  if (length(coord_targets) > 0) {
+    coord_defs <- list(
+      list(
+        targets = as.integer(coord_targets),
+        width = "90px",
+        className = "dt-nowrap"
+      )
+    )
+    column_defs <- c(column_defs, coord_defs)
+  }
+  long_col_candidates <- c(
+    "probes", "probe_ids", "probe_id", "genes", "gene_groups", "island_relation",
+    "combined_probes", "combined_genes", "annotations", "annotation"
+  )
+  long_col_targets <- setdiff(which(names(data) %in% long_col_candidates) - 1L, gene_col_targets)
+  if (length(long_col_targets) > 0) {
+    trunc_renderer <- JS(
+      "function(data, type, row, meta) {",
+      "  if(type !== 'display') return data;",
+      "  if(data == null) return '';",
+      "  var str = data.toString();",
+      "  if(str.length <= 80) return str;",
+      "  return '<span title=\"' + str + '\">' + str.slice(0, 80) + '…</span>';",
+      "}"
+    )
+    long_defs <- list(
+      list(
+        targets = as.integer(long_col_targets),
+        width = "200px",
+        className = "dt-nowrap",
+        render = trunc_renderer
+      )
+    )
+    column_defs <- c(column_defs, long_defs)
+  }
   dt_args <- list(
-    data = as.data.frame(data),
+    data = data,
     rownames = FALSE,
     filter = "top",
     options = list(pageLength = 25, scrollX = TRUE, columnDefs = column_defs, deferRender = TRUE)
@@ -6356,7 +7004,7 @@ build_manhattan_plotly <- function(res, title) {
     return(NULL)
   }
   df <- prep$data
-  label_df <- prep$label_df
+  label_df <- data.table::as.data.table(prep$label_df)
   color_map <- c("0" = "#1f77b4", "1" = "#ff7f0e")
   plot_obj <- plotly::plot_ly(
     df,
@@ -6376,6 +7024,15 @@ build_manhattan_plotly <- function(res, title) {
       yaxis = list(title = "-log10(p-value)")
     )
   if (nrow(label_df) > 0) {
+    if (!"tooltip_label" %in% names(label_df)) {
+      label_df[, tooltip_label := NA_character_]
+    }
+    if ("probe_id" %in% names(label_df)) {
+      label_df[, tooltip_label := df$tooltip[match(probe_id, df$probe_id)]]
+    }
+    if ("genesymbol_cgid" %in% names(label_df)) {
+      label_df[is.na(tooltip_label) | tooltip_label == "", tooltip_label := genesymbol_cgid]
+    }
     plot_obj <- plotly::add_trace(
       plot_obj,
       data = label_df,
@@ -6386,7 +7043,8 @@ build_manhattan_plotly <- function(res, title) {
       text = ~genesymbol_cgid,
       textposition = "top center",
       textfont = list(color = "#222222", size = 10),
-      hoverinfo = "none",
+      hoverinfo = "text",
+      hovertext = ~tooltip_label,
       showlegend = FALSE
     )
   }
@@ -6456,9 +7114,10 @@ if (nrow(batch_metrics_plot) > 0) {
   log_message("Skipping batch QC plot: insufficient batch metrics.")
 }
 
-enrichment_minfi <- run_enrichment(sig_annotated_minfi, "minfi")
-enrichment_sesame <- run_enrichment(sig_annotated_sesame, "sesame")
-enrichment_intersection <- run_enrichment(sig_annotated_intersection, "intersection")
+msigdb_pathways <- load_fgsea_pathways(project_root)
+enrichment_minfi <- run_enrichment(results_minfi, "minfi", annotation_data, msigdb_pathways)
+enrichment_sesame <- run_enrichment(results_sesame, "sesame", annotation_data, msigdb_pathways)
+enrichment_intersection <- run_enrichment(annotated_intersection, "intersection", annotation_data, msigdb_pathways)
 
 if (nrow(enrichment_minfi$results) > 0) {
   write_tsv_gz(enrichment_minfi$results, file.path(analysis_dir, "enrichment_minfi.tsv.gz"))
@@ -6572,6 +7231,18 @@ guard_interactive <- function(label, expr) {
       NULL
     }
   )
+}
+
+cap_interactive_table <- function(dt, max_rows = 5000) {
+  if (is.null(dt) || nrow(dt) <= max_rows) {
+    return(dt)
+  }
+  order_cols <- intersect(c("p.adjust", "padj", "p_value", "pval"), names(dt))
+  if (length(order_cols) > 0) {
+    setorderv(dt, order_cols, rep(1L, length(order_cols)))
+  }
+  log_message("Interactive table truncated to top %s rows (original %s) for rendering.", max_rows, nrow(dt))
+  head(dt, max_rows)
 }
 
 guard_interactive("model_selection_table", {
@@ -6739,6 +7410,21 @@ guard_interactive("table_intersection_dual", {
   )
   if (!is.null(path)) interactive_files$table_intersection_dual <- path
 })
+guard_interactive("table_dmr_intersection", {
+  meta <- interactive_output_metadata("table_dmr_intersection")
+  table_data <- cap_interactive_table(
+    simplify_dmr_table(copy(annotated_dmr_intersection_top)),
+    max_rows = 5000
+  )
+  path <- write_table_widget(
+    table_data,
+    file.path(interactive_dir, "table_dmr_intersection"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$table_dmr_intersection <- path
+})
 
 if (sesame_available && nrow(results_sesame) > 0) {
   guard_interactive("volcano_sesame", {
@@ -6767,14 +7453,30 @@ if (sesame_available && nrow(results_sesame) > 0) {
   })
   guard_interactive("table_sesame", {
     meta <- interactive_output_metadata("table_sesame")
+    table_data <- cap_interactive_table(copy(annotated_sesame), max_rows = 5000)
     path <- write_table_widget(
-      annotated_sesame,
+      table_data,
       file.path(interactive_dir, "table_sesame"),
       title = meta$title,
       subtitle = meta$subtitle,
       description = meta$description
     )
     if (!is.null(path)) interactive_files$table_sesame <- path
+  })
+  guard_interactive("table_dmr_sesame", {
+    meta <- interactive_output_metadata("table_dmr_sesame")
+    table_data <- cap_interactive_table(
+      simplify_dmr_table(copy(annotated_dmr_sesame)),
+      max_rows = 5000
+    )
+    path <- write_table_widget(
+      table_data,
+      file.path(interactive_dir, "table_dmr_sesame"),
+      title = meta$title,
+      subtitle = meta$subtitle,
+      description = meta$description
+    )
+    if (!is.null(path)) interactive_files$table_dmr_sesame <- path
   })
 }
 
@@ -6791,6 +7493,21 @@ guard_interactive("overlap_minfi_sesame", {
     )
     if (!is.null(path)) interactive_files$overlap_minfi_sesame <- path
   }
+})
+guard_interactive("table_dmr_minfi", {
+  meta <- interactive_output_metadata("table_dmr_minfi")
+  table_data <- cap_interactive_table(
+    simplify_dmr_table(copy(annotated_dmr_minfi)),
+    max_rows = 5000
+  )
+  path <- write_table_widget(
+    table_data,
+    file.path(interactive_dir, "table_dmr_minfi"),
+    title = meta$title,
+    subtitle = meta$subtitle,
+    description = meta$description
+  )
+  if (!is.null(path)) interactive_files$table_dmr_minfi <- path
 })
 
 guard_interactive("context_island", {
@@ -6907,6 +7624,21 @@ clean_paths <- function(x) {
 }
 interactive_files <- lapply(interactive_files, clean_paths)
 interactive_files <- Filter(function(x) length(x) > 0, interactive_files)
+
+reorder_interactive_files <- function(files) {
+  nms <- names(files)
+  if (is.null(nms)) return(files)
+  pipeline_priority <- function(name) {
+    if (grepl("intersection", name, ignore.case = TRUE)) return(1L)
+    if (grepl("minfi", name, ignore.case = TRUE)) return(2L)
+    if (grepl("sesame", name, ignore.case = TRUE)) return(3L)
+    0L
+  }
+  pri <- vapply(nms, pipeline_priority, integer(1))
+  ord <- order(pri, seq_along(files))
+  files[ord]
+}
+interactive_files <- reorder_interactive_files(interactive_files)
 
 # ---- Summary ----------------------------------------------------------------
 
@@ -7113,9 +7845,17 @@ summary <- list(
   batch_column = batch_to_use,
   sva_surrogates = surrogate_count,
   design_selection = design_selection_export,
+  group_roles = lapply(role_table$group, function(g) {
+    list(group = g, role = ifelse(g == group_reference_resolved, "con", "test"))
+  }),
   top_n_cpgs = opt$top_n_cpgs,
   heatmap_sources = list(
     intersection = intersection_heatmap_source
+  ),
+  dmr_counts = list(
+    minfi = nrow(annotated_dmr_minfi),
+    sesame = nrow(annotated_dmr_sesame),
+    intersection = nrow(annotated_dmr_intersection)
   ),
   significant_cpgs = list(
     minfi = nrow(sig_minfi),

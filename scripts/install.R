@@ -8,14 +8,12 @@ cran_packages <- c(
   "data.table" = "1.17.8",
   ggplot2 = "4.0.0",
   ggrepel = "0.9.6",
-  gprofiler2 = "0.2.3",
   plotly = "4.11.0",
   htmlwidgets = "1.6.4",
   DT = "0.34.0",
   RColorBrewer = "1.1-3",
   VennDiagram = "1.7.3",
-  Cairo = "1.6-2",
-  ragg = "1.3.2"
+  msigdbr = "7.5.1"
 )
 
 bioc_package_matrix <- list(
@@ -25,8 +23,7 @@ bioc_package_matrix <- list(
     sesameData = "1.27.1",
     limma = "3.66.0",
     sva = "3.58.0",
-    DMRcate = "3.6.0",
-    DMRcatedata = "2.0.0",
+    fgsea = "1.36.0",
     IlluminaHumanMethylationEPICanno.ilm10b4.hg19 = "0.6.0",
     IlluminaHumanMethylationEPICv2anno.20a1.hg38 = "1.0.0",
     IlluminaHumanMethylation450kanno.ilmn12.hg19 = "0.6.1",
@@ -40,8 +37,7 @@ bioc_package_matrix <- list(
     sesameData = "1.24.0",
     limma = "3.62.2",
     sva = "3.54.0",
-    DMRcate = "3.2.1",
-    DMRcatedata = "2.0.0",
+    fgsea = "1.32.4",
     IlluminaHumanMethylationEPICanno.ilm10b4.hg19 = "0.6.0",
     IlluminaHumanMethylationEPICv2anno.20a1.hg38 = "1.0.0",
     IlluminaHumanMethylation450kanno.ilmn12.hg19 = "0.6.1",
@@ -119,37 +115,71 @@ ensure_cran(cran_packages)
 bioc_selection <- select_bioc_packages(bioc_package_matrix)
 ensure_bioc(bioc_selection$packages, bioc_selection$version)
 
-`%||%` <- function(x, y) if (is.null(x)) y else x
-
-install_bitmap_support <- function() {
-  # Plotly/ggplotly needs a bitmap device for sizing; Cairo/ragg provide it.
-  required_caps <- c("cairo", "png", "jpeg")
-  current_caps <- capabilities()[required_caps]
-  if (any(current_caps)) {
-    return(invisible(TRUE))
+install_dmrff <- function(ref = "perishky/dmrff@8e0469e5238c4c2de84746af143a733600537be4") {
+  if (!requireNamespace("remotes", quietly = TRUE)) {
+    install.packages("remotes", repos = "https://cloud.r-project.org")
   }
-  message("No bitmap device detected (cairo/png/jpeg); attempting to install Cairo and ragg.")
-  tryCatch(
-    {
-      if (requireNamespace("Cairo", quietly = TRUE) && requireNamespace("ragg", quietly = TRUE)) {
-        return(invisible(TRUE))
-      }
-      remotes::install_version("Cairo", version = cran_packages[["Cairo"]], repos = "https://cloud.r-project.org", upgrade = "never", quiet = TRUE)
-      remotes::install_version("ragg", version = cran_packages[["ragg"]], repos = "https://cloud.r-project.org", upgrade = "never", quiet = TRUE)
-    },
-    error = function(e) {
-      warning(
-        sprintf(
-          "Bitmap device install failed: %s. Install system libs (libcairo2-dev libpng-dev libjpeg-dev libtiff-dev) and rerun.",
-          conditionMessage(e)
-        )
-      )
-    }
-  )
-  invisible(TRUE)
+  needs_install <- !requireNamespace("dmrff", quietly = TRUE)
+  if (!needs_install) {
+    sha <- tryCatch(utils::packageDescription("dmrff", fields = c("RemoteSha", "GithubSHA1")), error = function(...) NA_character_)
+    sha_str <- sha[!is.na(sha) & nzchar(sha)]
+    sha_str <- if (length(sha_str) > 0) sha_str[1] else NA_character_
+    needs_install <- is.na(sha_str) || !grepl("8e0469e", sha_str, fixed = TRUE)
+  }
+  if (needs_install) {
+    message(sprintf("Installing dmrff from %s", ref))
+    remotes::install_github(ref, upgrade = "never", quiet = TRUE)
+  } else {
+    message("dmrff already installed with expected revision; skipping.")
+  }
 }
 
-install_bitmap_support()
+install_dmrff()
+
+download_msigdb_fgsea <- function(cache_dir) {
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  cache_file <- file.path(cache_dir, "msigdb_fgsea_hs.rds")
+  if (file.exists(cache_file)) {
+    return(invisible(cache_file))
+  }
+  message("Downloading MSigDB gene sets (C2/C5/Reactome) via msigdbr...")
+  if (!requireNamespace("msigdbr", quietly = TRUE)) {
+    stop("msigdbr is required to download MSigDB gene sets; ensure install succeeded.")
+  }
+  fetch_set <- function(category, subcategory = NULL) {
+    msigdbr::msigdbr(
+      species = "Homo sapiens",
+      category = category,
+      subcategory = subcategory
+    )
+  }
+  c2 <- fetch_set("C2")
+  c5 <- fetch_set("C5")
+  reactome <- fetch_set("C2", "CP:REACTOME")
+  to_list <- function(df) {
+    split(df$gene_symbol, paste(df$gs_name, df$gs_cat, df$gs_subcat, sep = "|"))
+  }
+  payload <- list(
+    C2 = to_list(c2),
+    C5 = to_list(c5),
+    REACTOME = to_list(reactome)
+  )
+  saveRDS(payload, cache_file)
+  message("Saved MSigDB gene sets to ", cache_file)
+  invisible(cache_file)
+}
+
+script_dir <- tryCatch(normalizePath(dirname(sys.frame(1)$ofile %||% "."), winslash = "/", mustWork = FALSE), error = function(...) normalizePath(getwd(), winslash = "/", mustWork = FALSE))
+repo_root <- normalizePath(file.path(script_dir, ".."), winslash = "/", mustWork = FALSE)
+msigdb_cache_dir <- file.path(repo_root, ".dearmeta_cache", "msigdb")
+tryCatch(
+  download_msigdb_fgsea(msigdb_cache_dir),
+  error = function(e) {
+    warning("Failed to prefetch MSigDB gene sets: ", conditionMessage(e))
+  }
+)
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
 
 # Default ExperimentHub cache under project root if user hasn't set one
 maybe_set_hub_cache <- function() {

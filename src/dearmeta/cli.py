@@ -357,7 +357,7 @@ def analysis(
         None,
         "--group-ref",
         "--group_ref",
-        help="Reference priority list for contrasts (comma-separated, highest priority first).",
+        help="Reference priority list for contrasts (comma-separated, highest priority first). Required.",
     ),
     r_script: Optional[Path] = typer.Option(
         None,
@@ -378,6 +378,10 @@ def analysis(
         "auto",
         help="Cell composition reference ('auto', 'blood', or 'none'). Auto enables inference for blood datasets only.",
     ),
+    dmr_intersection_top: int = typer.Option(
+        10000,
+        help="Number of intersected DMRs to retain for dashboard/interactive outputs (full file still saved).",
+    ),
     workspace_root: Optional[Path] = typer.Option(
         None, "--workspace-root", help="Directory for the workspace/output (defaults to ./GSE123456)."
     ),
@@ -392,6 +396,8 @@ def analysis(
         raise typer.BadParameter("--p-threshold must be between 0 and 1")
     if delta_beta_threshold <= 0:
         raise typer.BadParameter("--delta-beta-threshold must be positive")
+    if dmr_intersection_top <= 0:
+        raise typer.BadParameter("--dmr-intersection-top must be a positive integer")
     valid_cell_refs = {"auto", "blood", "none"}
     normalized_cell_ref = cell_comp_reference.strip().lower()
     if normalized_cell_ref not in valid_cell_refs:
@@ -438,19 +444,20 @@ def analysis(
         if (group_sizes < min_group_size).any():
             problematic = group_sizes[group_sizes < min_group_size].to_dict()
             raise typer.BadParameter(f"Groups with insufficient sample count: {problematic}")
-        normalized_group_ref: Optional[str] = None
-        if group_ref is not None:
-            priority = [entry.strip() for entry in group_ref.split(",")]
-            priority = [entry for entry in priority if entry]
-            if not priority:
-                raise typer.BadParameter("--group-ref cannot be empty")
-            normalized_group_ref = ",".join(priority)
-            missing = [entry for entry in priority if entry not in group_sizes.index]
-            if missing:
-                logger.warning(
-                    "Some --group-ref entries are not present in dear_group and will be ignored if still absent after QC: %s",
-                    ", ".join(sorted(missing)),
-                )
+        if group_ref is None:
+            raise typer.BadParameter("You must provide --group-ref (comma-separated, case-insensitive) to pin the reference group.")
+        priority = [entry.strip() for entry in group_ref.split(",")]
+        priority = [entry for entry in priority if entry]
+        if not priority:
+            raise typer.BadParameter("--group-ref cannot be empty")
+        normalized_group_ref: Optional[str] = ",".join(priority)
+        group_levels_lower = {g.lower(): g for g in group_sizes.index}
+        missing = [entry for entry in priority if entry.lower() not in group_levels_lower]
+        if missing:
+            logger.warning(
+                "Some --group-ref entries are not present in dear_group and will be ignored if still absent after QC: %s",
+                ", ".join(sorted(missing)),
+            )
 
         logger.info("Running R analysis for %s with %s samples", gse, retained.shape[0])
         logger.debug("Using R script at %s", script_path)
@@ -469,6 +476,8 @@ def analysis(
             str(poobah_threshold),
             "--cell-comp-reference",
             normalized_cell_ref,
+            "--dmr-intersection-top",
+            str(dmr_intersection_top),
         ]
         if normalized_group_ref:
             extra_args.extend(["--group-ref", normalized_group_ref])
