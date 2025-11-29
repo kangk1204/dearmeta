@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import io
+import numpy as np
 
 import pandas as pd
 import typer
@@ -70,6 +71,18 @@ def build_structure(root: Path) -> dict:
         "idat": ensure_dir(root / "01_download" / "idat"),
         "metadata": ensure_dir(root / "01_download" / "metadata"),
         "logs": ensure_dir(root / "01_download" / "logs"),
+        "preprocess": ensure_dir(root / "02_preprocess"),
+        "analysis": ensure_dir(root / "03_analysis"),
+        "figures": ensure_dir(root / "04_figures"),
+        "interactive": ensure_dir(root / "05_interactive"),
+        "runtime": ensure_dir(root / "runtime"),
+    }
+    return paths
+
+
+def build_output_structure(root: Path) -> dict:
+    """Create only the output-facing directory structure."""
+    paths = {
         "preprocess": ensure_dir(root / "02_preprocess"),
         "analysis": ensure_dir(root / "03_analysis"),
         "figures": ensure_dir(root / "04_figures"),
@@ -213,6 +226,96 @@ def load_configure_dataframe(path: Path) -> pd.DataFrame:
     if "dear_group" not in df.columns:
         raise typer.BadParameter("configure.tsv missing 'dear_group' column")
     return df
+
+
+def _extract_comment_lines(path: Path) -> list[str]:
+    """Return leading comment lines from configure.tsv (normalising BOM/whitespace)."""
+    comments: list[str] = []
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for raw in handle:
+            line = raw.lstrip("\ufeff")
+            if not line.strip():
+                continue
+            if line.lstrip().startswith("#"):
+                comments.append(line.rstrip("\n"))
+                continue
+            break
+    return comments
+
+
+@app.command("subsample-configure")
+def subsample_configure(
+    gse: str = typer.Option(..., "--gse", help="GEO series accession (e.g. GSE123456)."),
+    n: int = typer.Option(..., "--n", min=1, help="Number of samples to retain per dear_group."),
+    seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for reproducibility."),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Destination for the subsampled TSV (default: <workspace>/configure_subsampled_<n>.tsv).",
+    ),
+    workspace_root: Optional[Path] = typer.Option(
+        None, "--workspace-root", help="Directory for the workspace/output (defaults to ./GSE123456)."
+    ),
+) -> None:
+    """Stratified random sampling by dear_group to keep n samples per group."""
+    gse = validate_gse(gse)
+    if n <= 0:
+        raise typer.BadParameter("--n must be positive")
+
+    root = _resolve_workspace_root(gse, workspace_root)
+    configure_path = root / "configure.tsv"
+    legacy_config_path = root / "runtime" / "configure.tsv"
+    if not configure_path.exists():
+        if legacy_config_path.exists():
+            logger.warning(
+                "Using legacy configure.tsv at %s (preferred location: %s)",
+                legacy_config_path,
+                configure_path,
+            )
+            configure_path = legacy_config_path
+        else:
+            raise typer.BadParameter(f"Missing configure.tsv at {configure_path}")
+
+    logger.info("Loading configure TSV from %s", configure_path)
+    config_df = load_configure_dataframe(configure_path).copy()
+    config_df["dear_group"] = config_df["dear_group"].astype("string").str.strip()
+    assigned = config_df[config_df["dear_group"].notna() & (config_df["dear_group"] != "")]
+    if assigned.empty:
+        raise typer.BadParameter("No samples with dear_group assigned; cannot subsample.")
+
+    group_order = list(dict.fromkeys(assigned["dear_group"]))
+    group_sizes = assigned.groupby("dear_group").size().reindex(group_order)
+    insufficient = {group: int(size) for group, size in group_sizes.items() if size < n}
+    if insufficient:
+        raise typer.BadParameter(
+            f"Requested {n} per group but some groups have fewer samples: {insufficient}"
+        )
+    targets = {group: n for group in group_sizes.index}
+
+    rng = np.random.default_rng(seed)
+    selected_indices: list[int] = []
+    for group, count in targets.items():
+        if count <= 0:
+            continue
+        group_indices = assigned[assigned["dear_group"] == group].index.to_numpy()
+        if count >= group_indices.size:
+            selected_indices.extend(group_indices.tolist())
+            continue
+        choices = rng.choice(group_indices, size=count, replace=False)
+        selected_indices.extend(choices.tolist())
+
+    selected_indices = sorted(selected_indices)
+    sampled_df = config_df.loc[selected_indices].copy()
+
+    output_path = output or (root / f"configure_subsampled_{n}.tsv")
+    ensure_dir(output_path.parent)
+    comments = _extract_comment_lines(configure_path)
+    csv_body = sampled_df.to_csv(sep="\t", index=False, lineterminator="\n")
+    content = "\n".join(comments) + "\n" + csv_body if comments else csv_body
+    output_path.write_text(content, encoding="utf-8")
+
+    console.print(f"[bold green]Wrote stratified sample[/] -> {output_path}")
+    logger.info("Subsampled dear_group counts: original=%s | target=%s", group_sizes.to_dict(), targets)
 
 
 @app.command()
@@ -378,12 +481,26 @@ def analysis(
         "auto",
         help="Cell composition reference ('auto', 'blood', or 'none'). Auto enables inference for blood datasets only.",
     ),
+    intersection_choice: str = typer.Option(
+        "worst",
+        help="Intersection stats source for shared CpGs: minfi, sesame, best (lower p), or worst (higher p).",
+    ),
     dmr_intersection_top: int = typer.Option(
         10000,
         help="Number of intersected DMRs to retain for dashboard/interactive outputs (full file still saved).",
     ),
     workspace_root: Optional[Path] = typer.Option(
         None, "--workspace-root", help="Directory for the workspace/output (defaults to ./GSE123456)."
+    ),
+    output_root: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        help="Directory for analysis outputs (defaults to workspace root).",
+    ),
+    configure: Optional[Path] = typer.Option(
+        None,
+        "--configure",
+        help="Explicit path to configure.tsv (defaults to workspace configure.tsv).",
     ),
 ) -> None:
     """Run the R-based analysis pipeline using prepared configure.tsv."""
@@ -398,6 +515,10 @@ def analysis(
         raise typer.BadParameter("--delta-beta-threshold must be positive")
     if dmr_intersection_top <= 0:
         raise typer.BadParameter("--dmr-intersection-top must be a positive integer")
+    normalized_intersection = intersection_choice.strip().lower()
+    allowed_intersection = {"minfi", "sesame", "best", "worst"}
+    if normalized_intersection not in allowed_intersection:
+        raise typer.BadParameter("--intersection-choice must be one of: minfi, sesame, best, worst")
     valid_cell_refs = {"auto", "blood", "none"}
     normalized_cell_ref = cell_comp_reference.strip().lower()
     if normalized_cell_ref not in valid_cell_refs:
@@ -406,22 +527,44 @@ def analysis(
     fdr_source = ctx.get_parameter_source("fdr_threshold") if ctx is not None else None
     fdr_explicit = fdr_source in (ParameterSource.COMMANDLINE, ParameterSource.ENVIRONMENT)
     root = _resolve_workspace_root(gse, workspace_root)
-    paths = build_structure(root)
+    output_root = _resolve_workspace_root(gse, output_root) if output_root else root
+    paths = build_output_structure(output_root)
     pipeline_log = paths["runtime"] / "pipeline.log"
     ensure_log_file_handler(logger, pipeline_log)
 
-    configure_path = root / "configure.tsv"
-    legacy_config_path = paths["runtime"] / "configure.tsv"
-    if not configure_path.exists():
-        if legacy_config_path.exists():
-            logger.warning(
-                "Using legacy configure.tsv at %s (preferred location: %s)",
-                legacy_config_path,
-                configure_path,
-            )
-            configure_path = legacy_config_path
+    if configure is not None:
+        supplied = configure.expanduser()
+        candidates: list[Path] = []
+        if supplied.is_absolute():
+            candidates.append(supplied)
         else:
-            raise typer.BadParameter(f"Missing configure.tsv at {configure_path}")
+            candidates.append((Path.cwd() / supplied).resolve())
+            candidates.append((root / supplied).resolve())
+        configure_path = next((path for path in candidates if path.exists()), None)
+        if configure_path is None:
+            raise typer.BadParameter(f"configure.tsv not found at any of: {', '.join(str(c) for c in candidates)}")
+    else:
+        configure_path = root / "configure.tsv"
+        legacy_config_path = root / "runtime" / "configure.tsv"
+        if not configure_path.exists():
+            if legacy_config_path.exists():
+                logger.warning(
+                    "Using legacy configure.tsv at %s (preferred location: %s)",
+                    legacy_config_path,
+                    configure_path,
+                )
+                configure_path = legacy_config_path
+            else:
+                raise typer.BadParameter(f"Missing configure.tsv at {configure_path}")
+
+    if output_root != root:
+        source_run_config = root / "runtime" / "run_config.json"
+        target_run_config = paths["runtime"] / "run_config.json"
+        if source_run_config.exists() and not target_run_config.exists():
+            try:
+                shutil.copy2(source_run_config, target_run_config)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Unable to copy run_config.json to output root: %s", exc)
 
     with ExitStack() as stack:
         if r_script is None:
@@ -472,6 +615,8 @@ def analysis(
             str(delta_beta_threshold),
             "--min-group-size",
             str(min_group_size),
+            "--intersection-choice",
+            normalized_intersection,
             "--poobah-threshold",
             str(poobah_threshold),
             "--cell-comp-reference",
@@ -491,7 +636,7 @@ def analysis(
             gse=gse,
             project_root=root,
             config_path=configure_path,
-            output_root=root,
+            output_root=output_root,
             r_script=script_path,
             extra_args=extra_args,
             env=env,
@@ -506,9 +651,7 @@ def analysis(
     else:
         logger.warning("analysis_summary.json missing at %s", summary_json)
 
-    console.print(
-        f"[bold green]Analysis complete[/] for {gse}. See runtime/analysis_summary.json for details."
-    )
+    console.print(f"[bold green]Analysis complete[/] for {gse}. See {summary_json} for details.")
     if summary_md is not None:
         try:
             rel_path = summary_md.relative_to(Path.cwd())

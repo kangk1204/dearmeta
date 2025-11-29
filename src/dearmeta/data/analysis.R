@@ -44,6 +44,7 @@ option_list <- list(
   make_option("--poobah-threshold", type = "double", dest = "poobah_threshold", default = 0.05, help = "Sesame pOOBAH failure threshold."),
   make_option("--drop-sesame-failed", action = "store_true", dest = "drop_sesame_failed", default = FALSE, help = "Drop samples exceeding the sesame pOOBAH threshold."),
   make_option("--cell-comp-reference", type = "character", dest = "cell_comp_reference", default = "auto", help = "Cell composition reference (auto, blood, none)."),
+  make_option("--intersection-choice", type = "character", dest = "intersection_choice", default = "worst", help = "Intersection stats source: minfi, sesame, best (lower p), or worst (higher p)."),
   make_option("--dmr-intersection-top", type = "integer", dest = "dmr_intersection_top", default = 10000, help = "Number of intersected DMRs to retain for dashboard/interactive outputs.")
 )
 
@@ -95,6 +96,12 @@ if (is.null(opt$p_threshold) || !is.finite(opt$p_threshold) || opt$p_threshold <
   stop("--p-threshold must be between 0 and 1 (inclusive of 1)")
 }
 
+opt$intersection_choice <- tolower(opt$intersection_choice %||% "worst")
+allowed_intersection <- c("minfi", "sesame", "best", "worst")
+if (!opt$intersection_choice %in% allowed_intersection) {
+  stop("--intersection-choice must be one of: minfi, sesame, best, worst")
+}
+
 POOBAH_FAILURE_THRESHOLD <- opt$poobah_threshold
 drop_sesame_failed <- isTRUE(opt$drop_sesame_failed)
 cell_comp_reference <- tolower(opt$cell_comp_reference %||% "auto")
@@ -109,11 +116,11 @@ output_root <- normalizePath(opt$output_root, mustWork = TRUE)
 # ---- Paths -----------------------------------------------------------------
 
 paths <- list(
-  preprocess = file.path(project_root, "02_preprocess"),
-  analysis = file.path(project_root, "03_analysis"),
-  figures = file.path(project_root, "04_figures"),
-  interactive = file.path(project_root, "05_interactive"),
-  runtime = file.path(project_root, "runtime")
+  preprocess = file.path(output_root, "02_preprocess"),
+  analysis = file.path(output_root, "03_analysis"),
+  figures = file.path(output_root, "04_figures"),
+  interactive = file.path(output_root, "05_interactive"),
+  runtime = file.path(output_root, "runtime")
 )
 
 for (dir_path in paths) {
@@ -406,7 +413,12 @@ ensure_namespace_available <- function(pkg, bioc = TRUE, auto_install_env = "DEA
   if (requireNamespace(pkg, quietly = TRUE)) {
     return(TRUE)
   }
-  auto_install <- tolower(Sys.getenv(auto_install_env, "false")) %in% c("1", "true", "yes", "on")
+  env_val <- tolower(Sys.getenv(auto_install_env, "auto"))
+  auto_install <- env_val %in% c("1", "true", "yes", "on")
+  if (!auto_install && env_val == "auto" && grepl("^flowsorted\\.", tolower(pkg))) {
+    # Default-on for FlowSorted references to avoid cell composition failures.
+    auto_install <- TRUE
+  }
   if (!auto_install) {
     return(FALSE)
   }
@@ -870,9 +882,11 @@ beta_from_M <- function(M_matrix) {
 }
 
 determine_sva_cap <- function(sample_count, design_cols, user_cap = NA_integer_) {
+  default_cap <- 5L
   if (!is.na(user_cap) && user_cap >= 0) {
     return(as.integer(user_cap))
   }
+  default_cap <- as.integer(default_cap)
   if (sample_count <= 8) {
     return(0L)
   }
@@ -881,8 +895,23 @@ determine_sva_cap <- function(sample_count, design_cols, user_cap = NA_integer_)
     return(0L)
   }
   dynamic_cap <- floor(sample_count / 4)
-  default_cap <- min(structural_cap, dynamic_cap, 15L)
-  max(default_cap, 0L)
+  cap <- min(structural_cap, dynamic_cap, default_cap)
+  max(cap, 0L)
+}
+
+resolve_sva_targets <- function() {
+  raw <- Sys.getenv("DEARMETA_SVA_PIPELINES", NA_character_)
+  if (is.na(raw) || !nzchar(raw)) {
+    return(c("minfi", "sesame"))
+  }
+  allowed <- c("minfi", "sesame")
+  tokens <- unique(trimws(strsplit(tolower(raw), ",")[[1]]))
+  tokens <- tokens[nzchar(tokens)]
+  targets <- intersect(tokens, allowed)
+  if (length(targets) == 0) {
+    return(allowed)
+  }
+  targets
 }
 
 apply_combat <- function(M_matrix, metadata, batch_col, design) {
@@ -1197,6 +1226,23 @@ build_batch_options <- function(metadata, group_col, manual_batches, candidate_b
   manual <- unique(manual_batches)
   auto <- setdiff(candidate_batches, manual)
   logged_invalid <- character()
+  small_cohort_excluded <- character()
+  is_small_cohort <- nrow(metadata) <= 30
+  fails_small_cohort_filter <- function(batch_vals, group_vals) {
+    if (!is_small_cohort) {
+      return(FALSE)
+    }
+    mask <- !is.na(batch_vals) & !is.na(group_vals)
+    if (!any(mask)) {
+      return(TRUE)
+    }
+    tab <- table(group_vals[mask], batch_vals[mask])
+    if (any(tab < 2)) {
+      return(TRUE)
+    }
+    props <- prop.table(tab, margin = 1)
+    any(props < 0.2)
+  }
   log_invalid <- function(col, reason) {
     if (!col %in% logged_invalid) {
       log_message("Excluding batch column %s: %s", col, reason)
@@ -1219,6 +1265,11 @@ build_batch_options <- function(metadata, group_col, manual_batches, candidate_b
       log_invalid(col, "confounded with dear_group levels")
       return(FALSE)
     }
+    if (fails_small_cohort_filter(metadata[[col]], metadata[[group_col]])) {
+      log_invalid(col, "excluded for small-cohort balance (min 2 per cell and >=20% per-group level)")
+      small_cohort_excluded <<- unique(c(small_cohort_excluded, col))
+      return(FALSE)
+    }
     TRUE
   }
   if (length(manual) > 0) {
@@ -1230,7 +1281,9 @@ build_batch_options <- function(metadata, group_col, manual_batches, candidate_b
   stats <- covariate_association_stats(metadata, group_col, factor_covars = auto)
   auto_ranked <- if (nrow(stats) > 0) stats[order(-score, name)]$name else character()
   auto_limited <- head(auto_ranked, max_auto)
-  unique(c(NA_character_, manual, auto_limited))
+  result <- unique(c(NA_character_, manual, auto_limited))
+  attr(result, "small_cohort_excluded") <- small_cohort_excluded
+  result
 }
 
 format_model_id <- function(set_id, batch_col, use_combat, use_sva) {
@@ -1299,62 +1352,80 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
       stop("design matrix is rank deficient")
     }
 
-    stage <- "sva_setup"
-    surrogate_vars <- NULL
-    n_sv <- 0L
-    if (isTRUE(params$use_sva)) {
-      mod_full <- design_base
-      mod0 <- model.matrix(~ 1, data = metadata)
-      n_sv <- tryCatch(num.sv(M_minfi, mod_full, method = "leek"), error = function(e) NA_integer_)
-      sample_count <- ncol(M_minfi)
-      design_cols <- ncol(design_base)
-      env_cap <- suppressWarnings(as.integer(Sys.getenv("DEARMETA_MAX_SV", NA_character_)))
-      if (length(env_cap) == 0 || is.na(env_cap)) {
-        env_cap <- NA_integer_
-      }
-      sv_cap <- determine_sva_cap(sample_count, design_cols, env_cap)
-      if (is.na(n_sv) || n_sv <= 0) {
-        n_sv <- 0L
-      } else {
-        if (!is.na(sv_cap) && sv_cap >= 0 && n_sv > sv_cap) {
-          log_message("SVA: reducing surrogate variable count from %s to %s (cap).", n_sv, sv_cap)
-          n_sv <- sv_cap
-        }
-      }
-      if (n_sv > 0) {
-        stage <- "compute_sva"
-        sva_obj <- sva(M_minfi, mod_full, mod0 = mod0, n.sv = n_sv)
-        surrogate_vars <- sva_obj$sv
-        surrogate_vars <- as.matrix(surrogate_vars)
-        colnames(surrogate_vars) <- paste0("SV", seq_len(ncol(surrogate_vars)))
-      } else {
-        log_message("SVA skipped (requested but cap resolved to zero surrogate variables).")
-      }
-    }
+  stage <- "sva_setup"
+  surrogate_vars <- NULL
+  n_sv <- 0L
+  sva_targets <- resolve_sva_targets()
+  apply_sva_minfi <- isTRUE(params$use_sva) && "minfi" %in% sva_targets
+  apply_sva_sesame <- isTRUE(params$use_sva) && sesame_available && "sesame" %in% sva_targets
+  sva_effective <- apply_sva_minfi || apply_sva_sesame
 
-    stage <- "apply_sva_minfi"
-    M_minfi_sva <- if (!is.null(surrogate_vars) && ncol(surrogate_vars) > 0) {
-      removeBatchEffect(M_minfi, covariates = surrogate_vars, design = design_base)
+  if (sva_effective) {
+    sva_source <- if (apply_sva_minfi) M_minfi else if (!is.null(M_sesame)) M_sesame else M_minfi
+    mod_full <- design_base
+    mod0 <- model.matrix(~ 1, data = metadata)
+    n_sv <- tryCatch(num.sv(sva_source, mod_full, method = "leek"), error = function(e) NA_integer_)
+    sample_count <- ncol(sva_source)
+    design_cols <- ncol(design_base)
+    env_cap <- suppressWarnings(as.integer(Sys.getenv("DEARMETA_MAX_SV", NA_character_)))
+    if (length(env_cap) == 0 || is.na(env_cap)) {
+      env_cap <- NA_integer_
+    }
+    sv_cap <- determine_sva_cap(sample_count, design_cols, env_cap)
+    if (is.na(n_sv) || n_sv <= 0) {
+      n_sv <- 0L
     } else {
-      M_minfi
-    }
-
-    stage <- "apply_sva_sesame"
-    M_sesame_sva <- if (sesame_available && !is.null(M_sesame)) {
-      if (!is.null(surrogate_vars) && ncol(surrogate_vars) > 0) {
-        removeBatchEffect(M_sesame, covariates = surrogate_vars, design = design_base)
-      } else {
-        M_sesame
+      if (!is.na(sv_cap) && sv_cap >= 0 && n_sv > sv_cap) {
+        log_message("SVA: reducing surrogate variable count from %s to %s (cap).", n_sv, sv_cap)
+        n_sv <- sv_cap
       }
+    }
+    if (n_sv > 0) {
+      stage <- "compute_sva"
+      sva_obj <- sva(sva_source, mod_full, mod0 = mod0, n.sv = n_sv)
+      surrogate_vars <- sva_obj$sv
+      surrogate_vars <- as.matrix(surrogate_vars)
+      colnames(surrogate_vars) <- paste0("SV", seq_len(ncol(surrogate_vars)))
     } else {
-      NULL
+      log_message("SVA skipped (requested but cap resolved to zero surrogate variables).")
     }
+  }
 
-    stage <- "design_with_sv"
-    design_with_sv <- construct_design(metadata$dear_group, numeric_final, factor_final, metadata, surrogate = surrogate_vars)
-    if (qr(design_with_sv)$rank < ncol(design_with_sv)) {
-      stop("design+SV matrix is rank deficient")
+  stage <- "apply_sva_minfi"
+  M_minfi_sva <- if (apply_sva_minfi && !is.null(surrogate_vars) && ncol(surrogate_vars) > 0) {
+    removeBatchEffect(M_minfi, covariates = surrogate_vars, design = design_base)
+  } else {
+    M_minfi
+  }
+
+  stage <- "apply_sva_sesame"
+  M_sesame_sva <- if (sesame_available && !is.null(M_sesame)) {
+    if (apply_sva_sesame && !is.null(surrogate_vars) && ncol(surrogate_vars) > 0) {
+      removeBatchEffect(M_sesame, covariates = surrogate_vars, design = design_base)
+    } else {
+      M_sesame
     }
+  } else {
+    NULL
+  }
+
+  stage <- "design_with_sv"
+  design_minfi <- if (apply_sva_minfi && !is.null(surrogate_vars) && ncol(surrogate_vars) > 0) {
+    construct_design(metadata$dear_group, numeric_final, factor_final, metadata, surrogate = surrogate_vars)
+  } else {
+    design_base
+  }
+  if (qr(design_minfi)$rank < ncol(design_minfi)) {
+    stop("design matrix (minfi) is rank deficient")
+  }
+  design_sesame <- if (sesame_available && apply_sva_sesame && !is.null(surrogate_vars) && ncol(surrogate_vars) > 0) {
+    construct_design(metadata$dear_group, numeric_final, factor_final, metadata, surrogate = surrogate_vars)
+  } else {
+    design_base
+  }
+  if (sesame_available && !is.null(design_sesame) && qr(design_sesame)$rank < ncol(design_sesame)) {
+    stop("design matrix (sesame) is rank deficient")
+  }
 
     stage <- "apply_combat"
     M_minfi_corrected <- M_minfi_sva
@@ -1369,7 +1440,7 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
           stop(sprintf("ComBat disabled for %s due to previous failure.", params$batch_col))
         }
         M_minfi_corrected <- tryCatch(
-          apply_combat(M_minfi_sva, metadata, params$batch_col, design_with_sv),
+          apply_combat(M_minfi_sva, metadata, params$batch_col, design_minfi),
           error = function(e) {
             mark_combat_failure(params$batch_col, conditionMessage(e))
             stop(e)
@@ -1377,7 +1448,7 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
         )
         if (sesame_available && !is.null(M_sesame_sva)) {
           M_sesame_corrected <- tryCatch(
-            apply_combat(M_sesame_sva, metadata, params$batch_col, design_with_sv),
+            apply_combat(M_sesame_sva, metadata, params$batch_col, design_sesame),
             error = function(e) {
               mark_combat_failure(params$batch_col, conditionMessage(e))
               stop(e)
@@ -1419,7 +1490,7 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
         if (is.null(rownames(beta_minfi_corrected))) "NULL" else "set"
       )
     }
-    results_minfi <- run_limma(M_minfi_corrected, beta_minfi_corrected, metadata, design_with_sv)
+    results_minfi <- run_limma(M_minfi_corrected, beta_minfi_corrected, metadata, design_minfi)
     results_minfi <- limit_top_hits(results_minfi, opt$top_n_cpgs)
 
     stage <- "limma_sesame"
@@ -1436,7 +1507,7 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
           if (is.null(rownames(beta_sesame_corrected))) "NULL" else "set"
         )
       }
-      results_sesame <- run_limma(M_sesame_corrected, beta_sesame_corrected, metadata, design_with_sv)
+      results_sesame <- run_limma(M_sesame_corrected, beta_sesame_corrected, metadata, design_sesame)
       results_sesame <- limit_top_hits(results_sesame, opt$top_n_cpgs)
     } else {
       results_sesame <- results_minfi[0]
@@ -1469,6 +1540,9 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
       0L
     }
 
+    n_surrogates_total <- if (!is.null(surrogate_vars)) ncol(surrogate_vars) else 0L
+    n_surrogates_minfi <- if (apply_sva_minfi && !is.null(surrogate_vars)) ncol(surrogate_vars) else 0L
+    n_surrogates_sesame <- if (apply_sva_sesame && !is.null(surrogate_vars)) ncol(surrogate_vars) else 0L
     metrics <- list(
       numeric_covars = numeric_final,
       factor_covars = params$factor_covars %||% character(),
@@ -1477,7 +1551,11 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
       use_combat = params$use_combat,
       batch_col = params$batch_col,
       batch_in_design = !params$use_combat && !is.null(params$batch_col),
-      n_surrogates = if (!is.null(surrogate_vars)) ncol(surrogate_vars) else 0L,
+      n_surrogates = n_surrogates_total,
+      n_surrogates_minfi = n_surrogates_minfi,
+      n_surrogates_sesame = n_surrogates_sesame,
+      sva_applied_minfi = apply_sva_minfi && n_surrogates_minfi > 0,
+      sva_applied_sesame = apply_sva_sesame && n_surrogates_sesame > 0,
       batch_median_p_minfi = batch_median_p_minfi,
       batch_median_r2_minfi = batch_minfi_post$median_r2,
       batch_delta_p_minfi = batch_median_p_minfi - baseline_minfi_candidate$median_p,
@@ -1503,7 +1581,9 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
     if (isTRUE(keep_outputs)) {
       outputs <- list(
         design_base = design_base,
-        design_with_sv = design_with_sv,
+        design_minfi = design_minfi,
+        design_sesame = design_sesame,
+        design_with_sv = design_minfi,
         surrogate_vars = surrogate_vars,
         M_minfi = M_minfi_corrected,
         beta_minfi = beta_minfi_corrected,
@@ -1514,7 +1594,12 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
         results_minfi = results_minfi,
         results_sesame = results_sesame,
         covariates_final = list(numeric = numeric_final, factor = factor_final),
-        n_surrogates = metrics$n_surrogates
+        n_surrogates = metrics$n_surrogates,
+        n_surrogates_minfi = metrics$n_surrogates_minfi,
+        n_surrogates_sesame = metrics$n_surrogates_sesame,
+        sva_targets = sva_targets,
+        sva_applied_minfi = metrics$sva_applied_minfi,
+        sva_applied_sesame = metrics$sva_applied_sesame
       )
     }
 
@@ -1535,6 +1620,18 @@ execute_model_configuration <- function(params, data, opt, candidate_batches, lo
 }
 
 optimize_design_matrix <- function(metadata, covariates, manual_covariates, protected_columns, candidate_batches, manual_batch_columns, M_minfi, M_sesame, sesame_available, opt, pca_minfi_pre = NULL, pca_sesame_pre = NULL, log_fn = log_message) {
+  max_models_cap <- {
+    env <- suppressWarnings(as.integer(Sys.getenv("DEARMETA_MAX_MODELS", NA_character_)))
+    if (is.na(env) || env <= 0) 120L else env
+  }
+  prescreen_rows <- {
+    env <- suppressWarnings(as.integer(Sys.getenv("DEARMETA_PRESCREEN_PROBES", NA_character_)))
+    if (is.na(env) || env <= 0) NA_integer_ else env
+  }
+  prescreen_top <- {
+    env <- suppressWarnings(as.integer(Sys.getenv("DEARMETA_PRESCREEN_TOP", NA_character_)))
+    if (is.na(env) || env <= 0) 20L else env
+  }
   required_numeric <- unique(manual_covariates$numeric)
   required_factor <- unique(c(manual_covariates$factor, intersect(protected_columns, covariates$factor)))
   optional_numeric <- setdiff(covariates$numeric, required_numeric)
@@ -1557,8 +1654,17 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
     max_combo_factor = max_combo_factor
   )
   batch_options <- build_batch_options(metadata, "dear_group", manual_batch_columns, candidate_batches)
+  batch_filtering <- list(
+    small_cohort_excluded = attr(batch_options, "small_cohort_excluded") %||% character()
+  )
+  is_small_cohort <- nrow(metadata) <= 30
   if (!is.null(log_fn)) {
-    log_fn("Evaluating %s covariate sets across %s batch options (including none).", length(covariate_sets), length(batch_options))
+    log_fn(
+      "Evaluating %s covariate sets across %s batch options (including none). Model cap: %s",
+      length(covariate_sets),
+      length(batch_options),
+      ifelse(is.finite(max_models_cap), max_models_cap, "none")
+    )
   }
   data_payload <- list(
     metadata = metadata,
@@ -1574,6 +1680,9 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
     for (batch_val in batch_options) {
       batch_col <- if (is.na(batch_val)) NULL else batch_val
       combat_opts <- if (is.null(batch_col)) c(FALSE) else c(FALSE, TRUE)
+      if (is_small_cohort) {
+        combat_opts <- c(FALSE)
+      }
       for (use_combat in combat_opts) {
         for (use_sva in c(FALSE, TRUE)) {
           model_id <- format_model_id(cov_set$id, batch_col, use_combat, use_sva)
@@ -1595,39 +1704,135 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
   if (!is.null(log_fn)) {
     log_fn("Generated %s model configurations for optimisation.", length(configs))
   }
-  evaluation <- vector("list", length(configs))
-  for (i in seq_along(configs)) {
-    params <- configs[[i]]
-    result <- execute_model_configuration(params, data_payload, opt, candidate_batches, log_fn = log_fn, keep_outputs = FALSE)
-    metrics <- result$metrics
-    evaluation[[i]] <- list(
-      model_id = params$model_id,
-      status = result$status,
-      message = result$message %||% "",
-      batch_col = params$batch_col %||% NA_character_,
-      use_combat = params$use_combat,
-      use_sva = params$use_sva,
-      batch_in_design = if (!is.null(metrics)) metrics$batch_in_design else NA,
-      n_surrogates = if (!is.null(metrics)) metrics$n_surrogates else NA_integer_,
-      n_covariates_numeric = if (!is.null(metrics)) length(metrics$numeric_covars) else NA_integer_,
-      n_covariates_factor = if (!is.null(metrics)) length(metrics$factor_covars) else NA_integer_,
-      batch_median_p_minfi = if (!is.null(metrics)) metrics$batch_median_p_minfi else NA_real_,
-      batch_median_r2_minfi = if (!is.null(metrics)) metrics$batch_median_r2_minfi else NA_real_,
-      batch_delta_p_minfi = if (!is.null(metrics)) metrics$batch_delta_p_minfi else NA_real_,
-      batch_median_p_sesame = if (!is.null(metrics)) metrics$batch_median_p_sesame else NA_real_,
-      batch_median_r2_sesame = if (!is.null(metrics)) metrics$batch_median_r2_sesame else NA_real_,
-      batch_delta_p_sesame = if (!is.null(metrics)) metrics$batch_delta_p_sesame else NA_real_,
-      selected_batch_delta_minfi = if (!is.null(metrics)) metrics$selected_batch_delta_p_minfi else NA_real_,
-      selected_batch_delta_sesame = if (!is.null(metrics)) metrics$selected_batch_delta_p_sesame else NA_real_,
-      group_median_p = if (!is.null(metrics)) metrics$group_median_p else NA_real_,
-      n_sig_minfi = if (!is.null(metrics)) metrics$n_sig_minfi else NA_integer_,
-      n_sig_sesame = if (!is.null(metrics)) metrics$n_sig_sesame else NA_integer_,
-      n_sig_intersection = if (!is.null(metrics)) metrics$n_sig_intersection else NA_integer_,
-      raw_sig_minfi = if (!is.null(metrics)) metrics$raw_sig_minfi else NA_integer_,
-      raw_sig_sesame = if (!is.null(metrics)) metrics$raw_sig_sesame else NA_integer_,
-      raw_sig_intersection = if (!is.null(metrics)) metrics$raw_sig_intersection else NA_integer_
-    )
+  if (!is.null(max_models_cap) && is.finite(max_models_cap) && length(configs) > max_models_cap) {
+    if (!is.null(log_fn)) {
+      log_fn("Truncating model configurations from %s to %s (DEARMETA_MAX_MODELS).", length(configs), max_models_cap)
+    }
+    configs <- configs[seq_len(max_models_cap)]
   }
+  evaluate_configs <- function(cfgs, payload, keep_outputs = FALSE, prescreen = FALSE) {
+    out <- vector("list", length(cfgs))
+    for (i in seq_along(cfgs)) {
+      params <- cfgs[[i]]
+      if (isTRUE(params$use_combat) && combat_is_blacklisted(params$batch_col)) {
+        out[[i]] <- list(
+          model_id = params$model_id,
+          status = "error",
+          message = sprintf("ComBat disabled for %s due to previous failure (preskip).", params$batch_col %||% "<none>"),
+          batch_col = params$batch_col %||% NA_character_,
+          use_combat = params$use_combat,
+          use_sva = params$use_sva,
+          batch_in_design = NA,
+          n_surrogates = NA_integer_,
+          n_surrogates_minfi = NA_integer_,
+          n_surrogates_sesame = NA_integer_,
+          sva_applied_minfi = NA,
+          sva_applied_sesame = NA,
+          n_covariates_numeric = NA_integer_,
+          n_covariates_factor = NA_integer_,
+          batch_median_p_minfi = NA_real_,
+          batch_median_r2_minfi = NA_real_,
+          batch_delta_p_minfi = NA_real_,
+          batch_median_p_sesame = NA_real_,
+          batch_median_r2_sesame = NA_real_,
+          batch_delta_p_sesame = NA_real_,
+          selected_batch_delta_minfi = NA_real_,
+          selected_batch_delta_sesame = NA_real_,
+          group_median_p = NA_real_,
+          n_sig_minfi = NA_integer_,
+          n_sig_sesame = NA_integer_,
+          n_sig_intersection = NA_integer_,
+          raw_sig_minfi = NA_integer_,
+          raw_sig_sesame = NA_integer_,
+          raw_sig_intersection = NA_integer_
+        )
+        next
+      }
+      res <- execute_model_configuration(params, payload, opt, candidate_batches, log_fn = if (prescreen) NULL else log_fn, keep_outputs = keep_outputs)
+      metrics <- res$metrics
+      out[[i]] <- list(
+        model_id = params$model_id,
+        status = res$status,
+        message = res$message %||% "",
+        batch_col = params$batch_col %||% NA_character_,
+        use_combat = params$use_combat,
+        use_sva = params$use_sva,
+        batch_in_design = if (!is.null(metrics)) metrics$batch_in_design else NA,
+        n_surrogates = if (!is.null(metrics)) metrics$n_surrogates else NA_integer_,
+        n_surrogates_minfi = if (!is.null(metrics)) metrics$n_surrogates_minfi else NA_integer_,
+        n_surrogates_sesame = if (!is.null(metrics)) metrics$n_surrogates_sesame else NA_integer_,
+        sva_applied_minfi = if (!is.null(metrics)) metrics$sva_applied_minfi else NA,
+        sva_applied_sesame = if (!is.null(metrics)) metrics$sva_applied_sesame else NA,
+        n_covariates_numeric = if (!is.null(metrics)) length(metrics$numeric_covars) else NA_integer_,
+        n_covariates_factor = if (!is.null(metrics)) length(metrics$factor_covars) else NA_integer_,
+        batch_median_p_minfi = if (!is.null(metrics)) metrics$batch_median_p_minfi else NA_real_,
+        batch_median_r2_minfi = if (!is.null(metrics)) metrics$batch_median_r2_minfi else NA_real_,
+        batch_delta_p_minfi = if (!is.null(metrics)) metrics$batch_delta_p_minfi else NA_real_,
+        batch_median_p_sesame = if (!is.null(metrics)) metrics$batch_median_p_sesame else NA_real_,
+        batch_median_r2_sesame = if (!is.null(metrics)) metrics$batch_median_r2_sesame else NA_real_,
+        batch_delta_p_sesame = if (!is.null(metrics)) metrics$batch_delta_p_sesame else NA_real_,
+        selected_batch_delta_minfi = if (!is.null(metrics)) metrics$selected_batch_delta_p_minfi else NA_real_,
+        selected_batch_delta_sesame = if (!is.null(metrics)) metrics$selected_batch_delta_p_sesame else NA_real_,
+        group_median_p = if (!is.null(metrics)) metrics$group_median_p else NA_real_,
+        n_sig_minfi = if (!is.null(metrics)) metrics$n_sig_minfi else NA_integer_,
+        n_sig_sesame = if (!is.null(metrics)) metrics$n_sig_sesame else NA_integer_,
+        n_sig_intersection = if (!is.null(metrics)) metrics$n_sig_intersection else NA_integer_,
+        raw_sig_minfi = if (!is.null(metrics)) metrics$raw_sig_minfi else NA_integer_,
+        raw_sig_sesame = if (!is.null(metrics)) metrics$raw_sig_sesame else NA_integer_,
+        raw_sig_intersection = if (!is.null(metrics)) metrics$raw_sig_intersection else NA_integer_
+      )
+    }
+    out
+  }
+
+  selected_configs <- configs
+  do_prescreen <- !is.na(prescreen_rows) && prescreen_rows > 0 && length(configs) > prescreen_top &&
+    nrow(M_minfi) > prescreen_rows
+  if (do_prescreen) {
+    if (!is.null(log_fn)) {
+      log_fn("Prescreening %s models using %s probes (top %s will be fully evaluated).", length(configs), prescreen_rows, prescreen_top)
+    }
+    set.seed(123)
+    idx <- sample(seq_len(nrow(M_minfi)), prescreen_rows)
+    M_minfi_ps <- M_minfi[idx, , drop = FALSE]
+    M_sesame_ps <- if (sesame_available && !is.null(M_sesame)) M_sesame[idx, , drop = FALSE] else NULL
+    data_payload_ps <- list(
+      metadata = metadata,
+      M_minfi = M_minfi_ps,
+      M_sesame = M_sesame_ps,
+      sesame_available = sesame_available,
+      pca_minfi_pre = pca_minfi_pre,
+      pca_sesame_pre = pca_sesame_pre
+    )
+    pres_eval <- evaluate_configs(configs, data_payload_ps, keep_outputs = FALSE, prescreen = TRUE)
+    pres_dt <- rbindlist(pres_eval, fill = TRUE)
+    if (nrow(pres_dt[status == "ok"]) > 0) {
+      pres_dt_ok <- pres_dt[status == "ok"]
+      pres_dt_ok[, batch_score := pmin(
+        ifelse(is.na(batch_median_p_minfi), 1, batch_median_p_minfi),
+        ifelse(is.na(batch_median_p_sesame), 1, batch_median_p_sesame)
+      )]
+      pres_dt_ok[, batch_penalty := pmax(
+        ifelse(is.na(batch_median_r2_minfi), 0, batch_median_r2_minfi),
+        ifelse(is.na(batch_median_r2_sesame), 0, batch_median_r2_sesame)
+      )]
+      setorder(pres_dt_ok, -batch_score, batch_penalty, -n_sig_intersection, -n_sig_minfi, -n_sig_sesame)
+      keep_ids <- head(pres_dt_ok$model_id, prescreen_top)
+      if (!is.null(log_fn)) {
+        log_fn("Prescreen selected top %s models: %s", length(keep_ids), paste(keep_ids, collapse = ", "))
+      }
+      selected_configs <- configs[vapply(configs, function(x) x$model_id %in% keep_ids, logical(1))]
+      if (length(selected_configs) == 0) {
+        selected_configs <- configs
+      }
+    } else {
+      if (!is.null(log_fn)) {
+        log_fn("Prescreen yielded no successful models; proceeding with full set.")
+      }
+    }
+  }
+
+  evaluation <- evaluate_configs(selected_configs, data_payload, keep_outputs = FALSE, prescreen = FALSE)
   evaluation_dt <- rbindlist(evaluation, fill = TRUE)
   evaluation_dt[, n_covariates_total := n_covariates_numeric + n_covariates_factor]
   valid_models <- evaluation_dt[status == "ok"]
@@ -1642,6 +1847,7 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
       covariate_sets = covariate_sets,
       covariate_stats = list(optional_numeric = stats_numeric, optional_factor = stats_factor),
       batch_options = batch_options,
+      batch_filtering = batch_filtering,
       error = "All model configurations failed"
     ))
   }
@@ -1727,6 +1933,7 @@ optimize_design_matrix <- function(metadata, covariates, manual_covariates, prot
     covariate_sets = covariate_sets,
     covariate_stats = list(optional_numeric = stats_numeric, optional_factor = stats_factor),
     batch_options = batch_options,
+    batch_filtering = batch_filtering,
     note = warning_note
   )
 }
@@ -1781,13 +1988,37 @@ fallback_design_selection <- function(metadata, covariates, manual_covariates, p
   evaluations <- list()
   for (cfg in fallback_configs) {
     res <- execute_model_configuration(cfg, data_payload, opt, candidate_batches, log_fn = log_fn, keep_outputs = TRUE)
+    metrics <- res$metrics
     evaluations[[length(evaluations) + 1L]] <- list(
       model_id = cfg$model_id,
       status = res$status,
       message = res$message %||% "",
       batch_col = cfg$batch_col %||% NA_character_,
       use_combat = cfg$use_combat,
-      use_sva = cfg$use_sva
+      use_sva = cfg$use_sva,
+      batch_in_design = if (!is.null(metrics)) metrics$batch_in_design else NA,
+      n_surrogates = if (!is.null(metrics)) metrics$n_surrogates else NA_integer_,
+      n_surrogates_minfi = if (!is.null(metrics)) metrics$n_surrogates_minfi else NA_integer_,
+      n_surrogates_sesame = if (!is.null(metrics)) metrics$n_surrogates_sesame else NA_integer_,
+      sva_applied_minfi = if (!is.null(metrics)) metrics$sva_applied_minfi else NA,
+      sva_applied_sesame = if (!is.null(metrics)) metrics$sva_applied_sesame else NA,
+      n_covariates_numeric = if (!is.null(metrics)) length(metrics$numeric_covars) else length(cfg$numeric_covars),
+      n_covariates_factor = if (!is.null(metrics)) length(metrics$factor_covars) else length(cfg$factor_covars),
+      batch_median_p_minfi = if (!is.null(metrics)) metrics$batch_median_p_minfi else NA_real_,
+      batch_median_r2_minfi = if (!is.null(metrics)) metrics$batch_median_r2_minfi else NA_real_,
+      batch_delta_p_minfi = if (!is.null(metrics)) metrics$batch_delta_p_minfi else NA_real_,
+      batch_median_p_sesame = if (!is.null(metrics)) metrics$batch_median_p_sesame else NA_real_,
+      batch_median_r2_sesame = if (!is.null(metrics)) metrics$batch_median_r2_sesame else NA_real_,
+      batch_delta_p_sesame = if (!is.null(metrics)) metrics$batch_delta_p_sesame else NA_real_,
+      selected_batch_delta_minfi = if (!is.null(metrics)) metrics$selected_batch_delta_p_minfi else NA_real_,
+      selected_batch_delta_sesame = if (!is.null(metrics)) metrics$selected_batch_delta_p_sesame else NA_real_,
+      group_median_p = if (!is.null(metrics)) metrics$group_median_p else NA_real_,
+      n_sig_minfi = if (!is.null(metrics)) metrics$n_sig_minfi else NA_integer_,
+      n_sig_sesame = if (!is.null(metrics)) metrics$n_sig_sesame else NA_integer_,
+      n_sig_intersection = if (!is.null(metrics)) metrics$n_sig_intersection else NA_integer_,
+      raw_sig_minfi = if (!is.null(metrics)) metrics$raw_sig_minfi else NA_integer_,
+      raw_sig_sesame = if (!is.null(metrics)) metrics$raw_sig_sesame else NA_integer_,
+      raw_sig_intersection = if (!is.null(metrics)) metrics$raw_sig_intersection else NA_integer_
     )
     if (identical(res$status, "ok")) {
       if (!is.null(log_fn)) {
@@ -2073,7 +2304,7 @@ filter_significant <- function(res, fdr, delta_thresh, p_thresh = 1, fdr_provide
   dt[mask]
 }
 
-merge_results <- function(minfi, sesame) {
+merge_results <- function(minfi, sesame, intersection_choice = "minfi") {
   minfi_dt <- copy(as.data.table(minfi))
   sesame_dt <- copy(as.data.table(sesame))
   minfi_dt[, pipeline := "minfi"]
@@ -2085,7 +2316,25 @@ merge_results <- function(minfi, sesame) {
   if (nrow(shared_keys) > 0) {
     key_cols <- names(shared_keys)
     union[shared_keys, shared_significant := TRUE, on = key_cols]
-    intersection <- minfi_dt[shared_keys, on = key_cols, nomatch = 0]
+    choice <- tolower(intersection_choice %||% "minfi")
+    if (choice %in% c("minfi", "sesame")) {
+      src <- if (choice == "sesame") sesame_dt else minfi_dt
+      intersection <- src[shared_keys, on = key_cols, nomatch = 0]
+    } else if (choice %in% c("best", "worst")) {
+      min_sub <- minfi_dt[shared_keys, on = key_cols]
+      ses_sub <- sesame_dt[shared_keys, on = key_cols]
+      pcol <- if ("adj.P.Val" %in% names(min_sub)) "adj.P.Val" else "P.Value"
+      p_min <- min_sub[[pcol]]
+      p_ses <- ses_sub[[pcol]]
+      if (choice == "best") {
+        take_minfi <- p_min <= p_ses
+      } else {
+        take_minfi <- p_min >= p_ses
+      }
+      intersection <- rbind(min_sub[take_minfi], ses_sub[!take_minfi], fill = TRUE)
+    } else {
+      intersection <- minfi_dt[shared_keys, on = key_cols, nomatch = 0]
+    }
   }
   list(union = union, intersection = intersection)
 }
@@ -3209,27 +3458,42 @@ create_interactive <- function(plot_obj, filename, title = NULL, subtitle = NULL
   )
 }
 
-write_dashboard_index <- function(project_root, interactive_dir, interactive_files, summary) {
-  root_index_path <- file.path(project_root, "index.html")
+write_dashboard_index <- function(output_root, interactive_dir, interactive_files, summary) {
+  root_index_path <- file.path(output_root, "index.html")
   interactive_index_path <- file.path(interactive_dir, "index.html")
 
-  gse_label <- summary$gse %||% format_identifier_title(basename(project_root))
+  gse_label <- summary$gse %||% format_identifier_title(basename(output_root))
   sample_count <- summary$samples %||% 0
   group_counts <- unlist(summary$groups %||% list(), use.names = TRUE)
   group_counts <- group_counts[!is.na(group_counts)]
   group_summary <- if (length(group_counts) > 0) paste(format_number(length(group_counts)), "groups") else "Single group"
 
   batch_label <- if (isTRUE(summary$combat_applied)) {
-    label <- "ComBat"
-    if (!is.null(summary$batch_column) && nzchar(summary$batch_column)) {
-      label <- paste0(label, " · ", summary$batch_column)
+      label <- "ComBat"
+      if (!is.null(summary$batch_column) && nzchar(summary$batch_column)) {
+        label <- paste0(label, " · ", summary$batch_column)
+      }
+      label
+    } else {
+      sv_total <- summary$sva_surrogates %||% 0
+      sv_detail <- summary$sva_surrogates_detail %||% list()
+      sv_minfi <- sv_detail$minfi %||% 0
+      sv_sesame <- sv_detail$sesame %||% 0
+      if (sv_total > 0) {
+        targets <- summary$sva_targets %||% character()
+        target_label <- if (length(targets) == 1) paste0(" (", targets, ")") else ""
+        if (sv_minfi != sv_sesame) {
+          paste0(
+            "SVA · minfi ", format_number(sv_minfi),
+            " / sesame ", format_number(sv_sesame), " SVs"
+          )
+        } else {
+          paste0("SVA", target_label, " · ", format_number(sv_total), " SVs")
+        }
+      } else {
+        "Baseline"
+      }
     }
-    label
-  } else if ((summary$sva_surrogates %||% 0) > 0) {
-    paste0("SVA · ", format_number(summary$sva_surrogates), " SVs")
-  } else {
-    "Baseline"
-  }
   batch_methods <- summary$batch_methods %||% list()
   batch_method_parts <- character()
   if (!is.null(batch_methods$minfi) && nzchar(batch_methods$minfi)) {
@@ -3347,7 +3611,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
   if (length(interactive_files) > 0) {
     entries <- lapply(names(interactive_files), function(key) {
       meta <- interactive_output_metadata(key)
-      href <- relative_to_root(interactive_files[[key]], project_root)
+      href <- relative_to_root(interactive_files[[key]], output_root)
       href <- gsub("\\\\", "/", href)
       icon_node <- htmltools::tags$span(class = "dm-link-card__icon", meta$icon)
       if (identical(key, "table_intersection_dual")) {
@@ -3632,7 +3896,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
       if (is.null(dir_path) || !nzchar(dir_path)) {
         return(NULL)
       }
-      href <- relative_to_root(dir_path, project_root)
+      href <- relative_to_root(dir_path, output_root)
       href <- gsub("\\\\", "/", href)
       entries <- summary$files[[name]] %||% list()
       count <- length(entries)
@@ -3655,7 +3919,7 @@ write_dashboard_index <- function(project_root, interactive_dir, interactive_fil
       if (is.null(file_path) || length(file_path) == 0 || all(is.na(file_path)) || all(!nzchar(file_path %||% ""))) {
         return(NULL)
       }
-      href <- relative_to_root(file_path, project_root)
+      href <- relative_to_root(file_path, output_root)
       href <- gsub("\\\\", "/", href)
       htmltools::tags$a(
         class = "dm-download-card dm-download-card--file",
@@ -4991,6 +5255,10 @@ if (sesame_available && !is.null(M_sesame)) {
   pca_sesame_pre <- empty_pca_result()
 }
 
+force_fallback <- identical(tolower(Sys.getenv("DEARMETA_FORCE_FALLBACK", "false")), "true") ||
+  identical(tolower(Sys.getenv("DEARMETA_FORCE_FALLBACK", "")), "1")
+design_optimisation <- NULL
+if (!force_fallback) {
   design_optimisation <- tryCatch(
     optimize_design_matrix(
       metadata = metadata_dt,
@@ -5006,14 +5274,18 @@ if (sesame_available && !is.null(M_sesame)) {
       pca_minfi_pre = pca_minfi_pre,
       pca_sesame_pre = pca_sesame_pre
     ),
-  error = function(e) {
-    log_message("Design optimisation errored: %s", conditionMessage(e))
-    NULL
-  }
-)
+    error = function(e) {
+      log_message("Design optimisation errored: %s", conditionMessage(e))
+      NULL
+    }
+  )
+}
 
 used_fallback_design <- FALSE
-if (is.null(design_optimisation) || is.null(design_optimisation$best)) {
+if (force_fallback || is.null(design_optimisation) || is.null(design_optimisation$best)) {
+  if (force_fallback) {
+    log_message("DEARMETA_FORCE_FALLBACK enabled: skipping optimisation and using fallback design selection.")
+  }
   design_optimisation <- tryCatch(
     fallback_design_selection(
       metadata = metadata_dt,
@@ -5067,8 +5339,9 @@ covars$factor <- selected_covariates$factor
 
 design_without_sv <- best_outputs$design_base
 surrogate_vars <- best_outputs$surrogate_vars
-design_for_limma <- best_outputs$design_with_sv
-group_comparisons <- resolve_group_contrasts(design_for_limma, metadata_dt)
+design_for_limma_minfi <- best_outputs$design_minfi %||% best_outputs$design_with_sv %||% design_without_sv
+design_for_limma_sesame <- best_outputs$design_sesame %||% design_for_limma_minfi
+group_comparisons <- resolve_group_contrasts(design_for_limma_minfi, metadata_dt)
 if (!is.null(group_comparisons) && nrow(group_comparisons) > 0) {
   # Assign roles per contrast: the reference_group of that contrast is control; the target_group is test.
   group_comparisons[, reference_role := "control"]
@@ -5108,20 +5381,35 @@ results_minfi <- best_outputs$results_minfi
 results_sesame <- best_outputs$results_sesame
 
 batch_to_use <- best_params$batch_col
-surrogate_count <- best_outputs$n_surrogates
+surrogate_counts <- list(
+  minfi = best_outputs$n_surrogates_minfi %||% 0L,
+  sesame = best_outputs$n_surrogates_sesame %||% 0L
+)
+surrogate_counts$total <- max(surrogate_counts$minfi %||% 0L, surrogate_counts$sesame %||% 0L)
 
-selected_minfi_method <-
-  if (isTRUE(best_params$use_combat) && isTRUE(best_params$use_sva)) {
+selected_minfi_method <- if (isTRUE(best_params$use_combat) && isTRUE(best_outputs$sva_applied_minfi)) {
+  "combat+sva"
+} else if (isTRUE(best_params$use_combat)) {
+  "combat"
+} else if (isTRUE(best_outputs$sva_applied_minfi)) {
+  "sva"
+} else {
+  "none"
+}
+
+selected_sesame_method <- if (sesame_available && !is.null(M_sesame_corrected)) {
+  if (isTRUE(best_params$use_combat) && isTRUE(best_outputs$sva_applied_sesame)) {
     "combat+sva"
   } else if (isTRUE(best_params$use_combat)) {
     "combat"
-  } else if (isTRUE(best_params$use_sva)) {
+  } else if (isTRUE(best_outputs$sva_applied_sesame)) {
     "sva"
   } else {
     "none"
   }
-
-selected_sesame_method <- if (sesame_available && !is.null(M_sesame_corrected)) selected_minfi_method else "not_available"
+} else {
+  "not_available"
+}
 
 log_message(
   "Automated design selected (model %s): batch=%s, combat=%s, sva=%s, numeric covariates=%s, factor covariates=%s",
@@ -5135,9 +5423,9 @@ log_message(
 
 log_message("Running limma differential methylation with selected design...")
 
-minfi_correction_applied <- isTRUE(best_metrics$batch_in_design) || isTRUE(best_params$use_combat) || isTRUE(best_params$use_sva)
+minfi_correction_applied <- isTRUE(best_metrics$batch_in_design) || isTRUE(best_params$use_combat) || isTRUE(best_outputs$sva_applied_minfi)
 sesame_correction_applied <- sesame_available && !identical(selected_sesame_method, "not_available") &&
-  (isTRUE(best_metrics$batch_in_design) || isTRUE(best_params$use_combat) || isTRUE(best_params$use_sva))
+  (isTRUE(best_metrics$batch_in_design) || isTRUE(best_params$use_combat) || isTRUE(best_outputs$sva_applied_sesame))
 
 design_selection_summary <- list(
   strategy = if (used_fallback_design || (!is.null(design_optimisation$note) && identical(design_optimisation$note, "fallback"))) "fallback" else "optimisation",
@@ -5148,6 +5436,7 @@ design_selection_summary <- list(
   covariate_sets = design_optimisation$covariate_sets,
   covariate_stats = design_optimisation$covariate_stats,
   batch_options = design_optimisation$batch_options,
+  batch_filtering = design_optimisation$batch_filtering %||% list(),
   note = design_optimisation$note %||% NULL
 )
 
@@ -5200,7 +5489,8 @@ if (!is.null(model_evaluations) && nrow(model_evaluations) > 0) {
 sig_minfi <- filter_significant(results_minfi, opt$fdr_threshold, opt$delta_beta_threshold, opt$p_threshold, opt$fdr_provided)
 sig_sesame <- filter_significant(results_sesame, opt$fdr_threshold, opt$delta_beta_threshold, opt$p_threshold, opt$fdr_provided)
 
-integrated <- merge_results(sig_minfi, sig_sesame)
+log_message("Integrating minfi & sesame results using intersection strategy: %s", opt$intersection_choice)
+integrated <- merge_results(sig_minfi, sig_sesame, opt$intersection_choice)
 integrated$union <- limit_top_hits(integrated$union, opt$top_n_cpgs)
 integrated$intersection <- limit_top_hits(integrated$intersection, opt$top_n_cpgs)
 
@@ -7807,7 +8097,14 @@ batch_metrics <- list(
   sesame_post = collect_batch_metrics(pca_sesame_post, candidate_batches)
 )
 
-surrogate_count <- if (!is.null(surrogate_vars)) ncol(as.matrix(surrogate_vars)) else 0
+surrogate_counts_export <- surrogate_counts
+if (is.null(surrogate_counts_export)) {
+  surrogate_counts_export <- list(
+    minfi = if (!is.null(surrogate_vars)) ncol(as.matrix(surrogate_vars)) else 0L,
+    sesame = if (!is.null(surrogate_vars)) ncol(as.matrix(surrogate_vars)) else 0L
+  )
+  surrogate_counts_export$total <- max(surrogate_counts_export$minfi %||% 0L, surrogate_counts_export$sesame %||% 0L)
+}
 
 model_evaluations_dt <- if (is.null(model_evaluations)) data.table() else model_evaluations
 model_evaluations_export <- if (nrow(model_evaluations_dt) > 0) {
@@ -7901,7 +8198,8 @@ summary <- list(
     manual = batch_tracking$manual,
     final = candidate_batches,
     selected = batch_to_use,
-    diagnostics = batch_diagnostics_export
+    diagnostics = batch_diagnostics_export,
+    filtering = design_selection_summary$batch_filtering %||% list()
   ),
   protected_batch_columns = batch_tracking$protected,
   sample_qc = sample_qc_summary,
@@ -7925,7 +8223,9 @@ summary <- list(
   combat_applied = isTRUE(best_params$use_combat),
   combat_models = combat_summary,
   batch_column = batch_to_use,
-  sva_surrogates = surrogate_count,
+  sva_surrogates = surrogate_counts_export$total,
+  sva_surrogates_detail = surrogate_counts_export,
+  sva_targets = best_outputs$sva_targets %||% resolve_sva_targets(),
   design_selection = design_selection_export,
   group_roles = lapply(role_table$group, function(g) {
     list(group = g, role = ifelse(g == group_reference_resolved, "con", "test"))
@@ -7952,6 +8252,9 @@ summary <- list(
   overlap_top_n = detailed_overlap_stats,
   top_cpgs = top_cpgs,
   batch_metrics = batch_metrics,
+  integration = list(
+    intersection_choice = opt$intersection_choice
+  ),
   shared_cpgs = list(
     count = nrow(annotated_shared),
     concordant = if ("concordant_direction" %in% names(annotated_shared)) sum(annotated_shared$concordant_direction, na.rm = TRUE) else 0
@@ -7976,13 +8279,13 @@ summary <- list(
     runtime = manifest_entries(paths$runtime)
   )
 )
-dashboard_paths <- write_dashboard_index(project_root, interactive_dir, interactive_files, summary)
+dashboard_paths <- write_dashboard_index(output_root, interactive_dir, interactive_files, summary)
 summary$dashboard <- list(
   root = dashboard_paths$root,
   interactive = dashboard_paths$interactive
 )
-runtime_summary_path <- file.path(paths$runtime %||% project_root, "analysis_summary.json")
-root_summary_path <- file.path(project_root, "analysis_summary.json")
+runtime_summary_path <- file.path(paths$runtime %||% output_root, "analysis_summary.json")
+root_summary_path <- file.path(output_root, "analysis_summary.json")
 log_message("Summary outputs:", runtime_summary_path, root_summary_path)
 dir.create(dirname(runtime_summary_path), recursive = TRUE, showWarnings = FALSE)
 write_json(summary, runtime_summary_path, pretty = TRUE, auto_unbox = TRUE)

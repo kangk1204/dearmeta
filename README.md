@@ -228,6 +228,7 @@ Again, confirm the `renv` library path in the R output.
    ```bash
    dearmeta analysis --gse GSE123456 --group-ref control
    ```
+   > Use `--configure /path/to/file.tsv` to point at a custom configure file, and `--output /path/to/out_dir` to write results to a different folder while still reading IDATs from the workspace.
    > `--group-ref` (alias `--group_ref`) is **required**. Supply a comma-separated, case-insensitive priority list (e.g., `control` or `control,MD`). The first group present becomes the control baseline; all other groups are treated as test. Every contrast uses its own reference/target groups, and dashboards label them as “test vs control” accordingly.
 5. Reproduce this exact software stack:
    ```bash
@@ -249,6 +250,7 @@ Again, confirm the `renv` library path in the R output.
 - `--drop-sesame-failed` removes samples whose sesame failure rate exceeds the threshold before continuing.
 - Batch/sample processing currently runs serially for stability; there is no parallel worker flag to configure.
 - See `docs/statistical_assumptions.md` for citations supporting every QC/batch threshold shipped with DearMeta.
+- Intersection strategy: `--intersection-choice {minfi,sesame,best,worst}` picks which pipeline contributes effect sizes/p-values for the CpG/DMR intersection (default `worst` = more conservative; `best` = more liberal).
 - Batch/covariate heuristics: biology-driven columns (tissue, treatment, disease, cell*) are blocked from being auto-batch; candidates that duplicate `dear_group` or lack cross-group replication are excluded. ComBat is only attempted when the batch is non-confounded; after a singular fit the batch is blacklisted for the run. SVA surrogate count is capped by degrees-of-freedom (override with `DEARMETA_MAX_SV`) to prevent overfitting.
 
 ### Cell composition (blood datasets)
@@ -277,6 +279,12 @@ GSE123456/
     - `--group-ref control,MD` with groups control/MD/AD → contrasts `MD_vs_control`, `AD_vs_control`, and `AD_vs_MD` (MD used as control for the AD vs MD contrast because it is higher priority and present).
   - Names not found in `dear_group` are ignored; execution stops if none of the supplied names are present.
 - Dashboards and plots label comparisons as “test vs control” using this reference to make the effect direction explicit and avoid sign flips.
+
+### Subsampling configure.tsv (balanced by dear_group)
+- Use `dearmeta subsample-configure --gse GSE123456 --n 20 --seed 42` to keep exactly 20 samples **per dear_group** using stratified random sampling.
+- Provide `--output path/to/configure_subsampled.tsv` to control the destination (default: `./GSE123456/configure_subsampled_<n>.tsv`).
+- If any group has fewer than `n` samples, the command aborts with an error so you can pick a smaller per-group size.
+- You can feed the subsampled file into analysis via `--configure` (see Quick Start above) without moving the original `configure.tsv`.
 
 ## Tips & Troubleshooting
 - **Reusing downloads:** Copy `.dearmeta_cache/` from an existing machine to avoid re-downloading long-lived GEO artifacts.
